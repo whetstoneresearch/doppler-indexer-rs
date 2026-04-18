@@ -1787,18 +1787,378 @@ async fn main() -> anyhow::Result<()> {
 
 ---
 
+## Solana-Specific Endpoints
+
+These endpoints expose data from Solana-only tables (`sol_cpmm_positions`, `sol_cpmm_migrator`, `sol_prediction_markets`, `sol_prediction_entries`, `sol_prediction_claims`). All address fields are Solana pubkeys serialized as base58 strings. `block_height` is the Solana slot number (equivalent to `block_number` on EVM chains).
+
+All amounts stored as `BIGINT` (u64 token quantities) are returned as **decimal strings** to avoid 53-bit JSON integer overflow.
+
+---
+
+### CPMM Positions
+
+#### `GET /v1/cpmm/positions`
+
+List CPMM liquidity positions, filterable by pool or owner.
+
+**Query Parameters**
+
+| Name         | Type    | Description                                   |
+|--------------|---------|-----------------------------------------------|
+| `chain_id`   | integer | **Required**                                  |
+| `pool`       | string  | Filter by pool pubkey (base58)                |
+| `owner`      | string  | Filter by owner pubkey (base58)               |
+| `open_only`  | boolean | If `true`, exclude positions with `closed_at` set |
+| `cursor`, `limit` |    | See Pagination                                |
+| `order`      | enum    | `desc` (default), `asc` — ordered by `(block_height, id)` |
+
+Uses **feed pagination**.
+
+**Response** `200 OK`
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "chain_id": 1399811149,
+      "block_height": 320000000,
+      "created_at": 1710504000,
+      "closed_at": null,
+      "position": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+      "pool": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bT",
+      "owner": "FXqTHkFkPkX4bJkMdwRNMKSUVV7UF2rDHqfSFj5LLWD",
+      "position_id": 42
+    }
+  ],
+  "pagination": { "next_cursor": "...", "has_more": false }
+}
+```
+
+#### `GET /v1/cpmm/positions/:position`
+
+Single CPMM position by position pubkey.
+
+**Query Parameters**: `chain_id` (required)
+
+**Response** `200 OK` — single position object (no envelope)
+
+---
+
+### CPMM Migrator
+
+#### `GET /v1/cpmm/migrators`
+
+List CPMM migrator launch records.
+
+**Query Parameters**
+
+| Name         | Type    | Description                              |
+|--------------|---------|------------------------------------------|
+| `chain_id`   | integer | **Required**                             |
+| `migrated`   | boolean | Filter by migration status               |
+| `cursor`, `limit` |    | See Pagination                           |
+| `order`      | enum    | `desc` (default), `asc` — by `(block_height, id)` |
+
+Uses **feed pagination**.
+
+**Response** `200 OK`
+
+```json
+{
+  "data": [
+    {
+      "id": 10,
+      "chain_id": 1399811149,
+      "block_height": 320000001,
+      "created_at": 1710504100,
+      "launch": "LaunchAcctPubkey11111111111111111111111111",
+      "state": "StateAcctPubkey1111111111111111111111111111",
+      "cpmm_config": "CpmmConfigPubkey111111111111111111111111111",
+      "min_raise_quote": "1000000000",
+      "pool": null,
+      "quote_for_liquidity": null,
+      "base_for_liquidity": null,
+      "migrated": false
+    }
+  ],
+  "pagination": { "next_cursor": null, "has_more": false }
+}
+```
+
+`min_raise_quote`, `quote_for_liquidity`, `base_for_liquidity` are decimal strings (u64 token amounts).
+
+#### `GET /v1/cpmm/migrators/:launch`
+
+Single migrator record by launch pubkey.
+
+**Query Parameters**: `chain_id` (required)
+
+**Response** `200 OK` — single migrator object (no envelope)
+
+---
+
+### Prediction Markets
+
+#### `GET /v1/prediction/markets`
+
+List prediction markets.
+
+**Query Parameters**
+
+| Name         | Type    | Description                                     |
+|--------------|---------|------------------------------------------------ |
+| `chain_id`   | integer | **Required**                                    |
+| `oracle`     | string  | Filter by oracle pubkey (base58)                |
+| `quote_mint` | string  | Filter by quote mint pubkey (base58)            |
+| `resolved`   | boolean | Filter: has `resolved_at` set                   |
+| `cursor`, `limit` |    | See Pagination                                  |
+| `order`      | enum    | `desc` (default), `asc` — by `(block_height, id)` |
+
+Uses **feed pagination**.
+
+**Response** `200 OK`
+
+```json
+{
+  "data": [
+    {
+      "id": 5,
+      "chain_id": 1399811149,
+      "block_height": 320000010,
+      "created_at": 1710505000,
+      "resolved_at": null,
+      "market": "MarketPubkey1111111111111111111111111111111",
+      "oracle": "OraclePubkey111111111111111111111111111111",
+      "quote_mint": "QuoteMintPubkey1111111111111111111111111111",
+      "winner_mint": null,
+      "claimable_supply": null,
+      "total_pot": null
+    }
+  ],
+  "pagination": { "next_cursor": null, "has_more": false }
+}
+```
+
+`claimable_supply` and `total_pot` are decimal strings when present (u64 token amounts).
+
+#### `GET /v1/prediction/markets/:market`
+
+Single prediction market by market pubkey.
+
+**Query Parameters**: `chain_id` (required)
+
+**Response** `200 OK` — single market object (no envelope)
+
+#### `GET /v1/prediction/markets/:market/entries`
+
+Entries registered for a prediction market.
+
+**Query Parameters**
+
+| Name         | Type    | Description                              |
+|--------------|---------|------------------------------------------|
+| `chain_id`   | integer | **Required**                             |
+| `is_winner`  | boolean | Filter by winner status                  |
+| `cursor`, `limit` |    | See Pagination                           |
+
+**Entry Object**
+
+```json
+{
+  "id": 20,
+  "chain_id": 1399811149,
+  "block_height": 320000020,
+  "created_at": 1710506000,
+  "market": "MarketPubkey1111111111111111111111111111111",
+  "oracle": "OraclePubkey111111111111111111111111111111",
+  "entry_id": "EntryIdPubkey11111111111111111111111111111",
+  "base_mint": "BaseMintPubkey1111111111111111111111111111",
+  "contribution": "500000000",
+  "is_winner": null
+}
+```
+
+`contribution` is a decimal string (u64 token amount); `is_winner` is `null` until the market resolves.
+
+#### `GET /v1/prediction/markets/:market/claims`
+
+Reward claims against a prediction market, sorted by `(block_height DESC, id DESC)`.
+
+**Query Parameters**
+
+| Name         | Type    | Description                              |
+|--------------|---------|------------------------------------------|
+| `chain_id`   | integer | **Required**                             |
+| `claimer`    | string  | Filter by claimer pubkey (base58)        |
+| `cursor`, `limit` |    | See Pagination                           |
+
+Uses **feed pagination**.
+
+**Claim Object**
+
+```json
+{
+  "id": 100,
+  "chain_id": 1399811149,
+  "block_height": 320000100,
+  "created_at": 1710510000,
+  "tx_id": "5KJp8Xv2mNrQHs3oT6vLuB9cJkFdEoR7pWyZ4nM1qSt...",
+  "log_position": 0,
+  "market": "MarketPubkey1111111111111111111111111111111",
+  "claimer": "ClaimerPubkey11111111111111111111111111111",
+  "burned_amount": "250000000",
+  "reward_amount": "312500000",
+  "total_burned": "500000000"
+}
+```
+
+All amount fields are decimal strings (u64). `tx_id` is the base58-encoded 64-byte Solana transaction signature.
+
+---
+
+### GraphQL additions
+
+The following types extend the GraphQL schema for Solana-specific data. They follow the same address conventions as existing types — all pubkeys serialize as base58 `Address` scalars.
+
+```graphql
+type CpmmPosition {
+  id: Int!
+  chainId: Int!
+  blockHeight: Int!
+  createdAt: DateTime!
+  closedAt: DateTime
+  position: Address!
+  pool: Address!
+  owner: Address!
+  positionId: Int!
+}
+
+type CpmmMigrator {
+  id: Int!
+  chainId: Int!
+  blockHeight: Int!
+  createdAt: DateTime!
+  launch: Address!
+  state: Address
+  cpmmConfig: Address
+  minRaiseQuote: BigDecimal
+  pool: Address
+  quoteForLiquidity: BigDecimal
+  baseForLiquidity: BigDecimal
+  migrated: Boolean!
+}
+
+type PredictionMarket {
+  id: Int!
+  chainId: Int!
+  blockHeight: Int!
+  createdAt: DateTime!
+  resolvedAt: DateTime
+  market: Address!
+  oracle: Address!
+  quoteMint: Address!
+  winnerMint: Address
+  claimableSupply: BigDecimal
+  totalPot: BigDecimal
+  # resolved relationships
+  entries(isWinner: Boolean, limit: Int, cursor: String): PredictionEntryPage!
+  claims(claimer: Address, limit: Int, cursor: String): PredictionClaimPage!
+}
+
+type PredictionEntry {
+  id: Int!
+  chainId: Int!
+  blockHeight: Int!
+  createdAt: DateTime!
+  market: Address!
+  oracle: Address!
+  entryId: Address!
+  baseMint: Address!
+  contribution: BigDecimal
+  isWinner: Boolean
+}
+
+type PredictionClaim {
+  id: Int!
+  chainId: Int!
+  blockHeight: Int!
+  createdAt: DateTime!
+  txId: String!
+  logPosition: Int!
+  market: Address!
+  claimer: Address!
+  burnedAmount: BigDecimal!
+  rewardAmount: BigDecimal!
+  totalBurned: BigDecimal!
+}
+
+type CpmmPositionPage   { data: [CpmmPosition!]!    pageInfo: PageInfo! }
+type CpmmMigratorPage   { data: [CpmmMigrator!]!    pageInfo: PageInfo! }
+type PredictionMarketPage{ data: [PredictionMarket!]! pageInfo: PageInfo! }
+type PredictionEntryPage { data: [PredictionEntry!]! pageInfo: PageInfo! }
+type PredictionClaimPage { data: [PredictionClaim!]! pageInfo: PageInfo! }
+```
+
+**Root query additions:**
+
+```graphql
+type Query {
+  # ... existing queries ...
+
+  cpmmPosition(chainId: Int!, position: Address!): CpmmPosition
+  cpmmPositions(
+    chainId: Int!
+    pool: Address
+    owner: Address
+    openOnly: Boolean
+    order: SortOrder
+    cursor: String
+    limit: Int
+  ): CpmmPositionPage!
+
+  cpmmMigrator(chainId: Int!, launch: Address!): CpmmMigrator
+  cpmmMigrators(
+    chainId: Int!
+    migrated: Boolean
+    order: SortOrder
+    cursor: String
+    limit: Int
+  ): CpmmMigratorPage!
+
+  predictionMarket(chainId: Int!, market: Address!): PredictionMarket
+  predictionMarkets(
+    chainId: Int!
+    oracle: Address
+    quoteMint: Address
+    resolved: Boolean
+    order: SortOrder
+    cursor: String
+    limit: Int
+  ): PredictionMarketPage!
+}
+```
+
+---
+
 ## Query Patterns Reference
 
-| Use case                          | Endpoint                              | Pagination    | Key parameters                                        |
-|-----------------------------------|---------------------------------------|---------------|-------------------------------------------------------|
-| New pools discovery feed          | `GET /v1/pools/new`                  | Feed          | `head_cursor` for live updates; `cursor` for history  |
-| Pool leaderboard by active liq    | `GET /v1/pools`                      | Leaderboard   | `sort_by=active_liquidity_usd`                        |
-| Pool leaderboard by TVL           | `GET /v1/pools`                      | Leaderboard   | `sort_by=tvl_usd`                                     |
-| Token OHLCV chart                 | `GET /v1/pools/:addr/snapshots`      | Feed          | `from_block`, `to_block`, `order=asc`                 |
-| Recent swaps feed                 | `GET /v1/swaps`                      | Feed          | `chain_id`, `pool`, `head_cursor` for live updates    |
-| Portfolio holdings                | `GET /v1/users/:addr/portfolio`      | Leaderboard   | `chain_id`                                            |
-| Price history for a token         | `GET /v1/prices`                     | Feed          | `token`, `quote_token`, `from`/`to`                   |
-| Graduation progress               | `GET /v1/pools/:addr/metrics`        | Feed          | latest row, `graduation_percentage`                   |
-| All positions in a pool           | `GET /v1/pools/:addr/positions`      | Leaderboard   | `owner` optional                                      |
-| Fee accumulation per LP           | `GET /v1/pools/:addr/fees`           | —             | `beneficiary` optional                                |
-| Multi-field pool + state in one   | `POST /graphql`                      | —             | nested `pool { state snapshots { ... } }`             |
+| Use case                          | Endpoint                                          | Pagination    | Key parameters                                        |
+|-----------------------------------|---------------------------------------------------|---------------|-------------------------------------------------------|
+| New pools discovery feed          | `GET /v1/pools/new`                              | Feed          | `head_cursor` for live updates; `cursor` for history  |
+| Pool leaderboard by active liq    | `GET /v1/pools`                                  | Leaderboard   | `sort_by=active_liquidity_usd`                        |
+| Pool leaderboard by TVL           | `GET /v1/pools`                                  | Leaderboard   | `sort_by=tvl_usd`                                     |
+| Token OHLCV chart                 | `GET /v1/pools/:addr/snapshots`                  | Feed          | `from_block`, `to_block`, `order=asc`                 |
+| Recent swaps feed                 | `GET /v1/swaps`                                  | Feed          | `chain_id`, `pool`, `head_cursor` for live updates    |
+| Portfolio holdings                | `GET /v1/users/:addr/portfolio`                  | Leaderboard   | `chain_id`                                            |
+| Price history for a token         | `GET /v1/prices`                                 | Feed          | `token`, `quote_token`, `from`/`to`                   |
+| Graduation progress               | `GET /v1/pools/:addr/metrics`                    | Feed          | latest row, `graduation_percentage`                   |
+| All positions in a pool           | `GET /v1/pools/:addr/positions`                  | Leaderboard   | `owner` optional                                      |
+| Fee accumulation per LP           | `GET /v1/pools/:addr/fees`                       | —             | `beneficiary` optional                                |
+| Multi-field pool + state in one   | `POST /graphql`                                  | —             | nested `pool { state snapshots { ... } }`             |
+| CPMM positions by owner           | `GET /v1/cpmm/positions`                         | Feed          | `owner`, `pool`, `open_only`                          |
+| CPMM migration status             | `GET /v1/cpmm/migrators/:launch`                 | —             | `chain_id`                                            |
+| Open prediction markets           | `GET /v1/prediction/markets`                     | Feed          | `resolved=false`, `oracle`, `quote_mint`              |
+| Market entries + winner flag      | `GET /v1/prediction/markets/:market/entries`     | Feed          | `is_winner` filter after resolution                   |
+| Reward claims for a market        | `GET /v1/prediction/markets/:market/claims`      | Feed          | `claimer` optional                                    |
+| Full market resolution snapshot   | `POST /graphql`                                  | —             | nested `predictionMarket { entries claims { ... } }`  |
