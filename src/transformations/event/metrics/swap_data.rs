@@ -361,6 +361,7 @@ pub fn process_liquidity_deltas(deltas: &[LiquidityInput], chain_id: u64) -> Vec
 /// Returns `Err` only if the DB refresh itself fails. Pools that remain absent
 /// after the refresh are logged and silently skipped — `process_swaps` already
 /// handles missing metadata gracefully by skipping the affected pools.
+#[allow(clippy::too_many_arguments)]
 pub async fn refresh_cache_if_needed(
     pool_ids: impl Iterator<Item = &Vec<u8>>,
     cache: &PoolMetadataCache,

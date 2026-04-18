@@ -85,9 +85,9 @@ async fn process_file(
 ) -> anyhow::Result<()> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mut reader = builder.build()?;
+    let reader = builder.build()?;
 
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
         let num_rows = batch.num_rows();
         *total_rows += num_rows as u64;

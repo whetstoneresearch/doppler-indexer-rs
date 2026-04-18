@@ -1673,7 +1673,7 @@ mod tests {
     fn single_trigger_handler_is_not_multi_trigger() {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(mock_handler("A", vec![]));
-        assert!(!registry.is_multi_trigger(&"A_v1".to_string()));
+        assert!(!registry.is_multi_trigger("A_v1"));
     }
 
     #[test]

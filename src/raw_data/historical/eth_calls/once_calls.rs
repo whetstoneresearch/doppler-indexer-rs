@@ -2232,7 +2232,7 @@ mod tests {
         // Step 4: a subsequent read_parquet_column_names returns full schema,
         // so the missing-column check would now pass — no infinite loop.
         let final_cols = read_parquet_column_names(&path);
-        let all_fn_names = vec!["getA".to_string(), "getB".to_string()];
+        let all_fn_names = ["getA".to_string(), "getB".to_string()];
         let missing: Vec<&String> = all_fn_names
             .iter()
             .filter(|f| !final_cols.contains(*f))
