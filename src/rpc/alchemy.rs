@@ -299,7 +299,8 @@ struct ConcurrentExecutor {
 }
 
 impl ConcurrentExecutor {
-    /// Spawn a task that acquires semaphore + rate limiter before executing.
+    /// Spawn a task that acquires the semaphore before executing.
+    /// Rate limiting is handled by the caller before spawning, not inside the task.
     /// Returns indexed result for ordering.
     fn spawn_indexed<T, Fut>(
         &self,
@@ -311,8 +312,6 @@ impl ConcurrentExecutor {
         Fut: Future<Output = T> + Send + 'static,
     {
         let semaphore = self.semaphore.clone();
-        let rate_limiter = self.rate_limiter.clone();
-        let cost = self.cost_per_request;
         let chain = self.chain.clone();
 
         join_set.spawn(async move {
@@ -321,7 +320,6 @@ impl ConcurrentExecutor {
                 .await
                 .expect("semaphore should never be closed during operation");
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).increment(1.0);
-            rate_limiter.acquire_with_metrics(cost, &chain).await;
             metrics::counter!("rpc_individual_calls_total", "chain" => chain.clone()).increment(1);
             let result = fut.await;
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).decrement(1.0);
@@ -330,7 +328,8 @@ impl ConcurrentExecutor {
         });
     }
 
-    /// Spawn a task that acquires semaphore + rate limiter, then sends result to channel.
+    /// Spawn a task that acquires the semaphore, then sends result to channel.
+    /// Rate limiting is handled by the caller before spawning, not inside the task.
     fn spawn_streaming<T, Fut>(
         &self,
         join_set: &mut tokio::task::JoinSet<()>,
@@ -341,8 +340,6 @@ impl ConcurrentExecutor {
         Fut: Future<Output = T> + Send + 'static,
     {
         let semaphore = self.semaphore.clone();
-        let rate_limiter = self.rate_limiter.clone();
-        let cost = self.cost_per_request;
         let chain = self.chain.clone();
 
         join_set.spawn(async move {
@@ -351,7 +348,6 @@ impl ConcurrentExecutor {
                 .await
                 .expect("semaphore should never be closed during operation");
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).increment(1.0);
-            rate_limiter.acquire_with_metrics(cost, &chain).await;
             metrics::counter!("rpc_individual_calls_total", "chain" => chain.clone()).increment(1);
             let result = fut.await;
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).decrement(1.0);
@@ -463,7 +459,7 @@ impl AlchemyClient {
             semaphore: self.rpc_semaphore.clone(),
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
-            max_in_flight: (self.config.rpc_concurrency * 2).max(1),
+            max_in_flight: self.config.rpc_concurrency.max(1),
             chain: self.chain_label(),
         }
     }
@@ -481,7 +477,7 @@ impl AlchemyClient {
             semaphore: Arc::new(Semaphore::new(effective)),
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
-            max_in_flight: (effective * 2).max(1),
+            max_in_flight: effective.max(1),
             chain: self.chain_label(),
         }
     }
@@ -490,10 +486,14 @@ impl AlchemyClient {
     /// Returns results in the same order as the input requests.
     ///
     /// Each request:
-    /// 1. Acquires a semaphore permit (limits concurrent in-flight requests)
-    /// 2. Acquires CUs from the rate limiter
+    /// 1. Acquires CUs from the rate limiter (paces task spawning)
+    /// 2. Spawns a task that acquires a semaphore permit (limits concurrent in-flight requests)
     /// 3. Executes the request
     /// 4. Stores result at its original index
+    ///
+    /// Rate limiting is applied at spawn time (not inside each task) so that CU consumption
+    /// is spread over time rather than all tasks recording their units simultaneously.
+    /// A select! loop allows result collection and rate-limited spawning to progress concurrently.
     ///
     /// Returns an error if any task panics.
     async fn execute_concurrent_ordered<T, Req, F, Fut>(
@@ -521,59 +521,85 @@ impl AlchemyClient {
         let mut join_set = JoinSet::new();
         let mut requests_iter = requests.into_iter().enumerate().peekable();
 
-        // Seed the initial batch up to the spawn window
-        while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-            let (idx, request) = requests_iter.next().unwrap();
-            let make_request = make_request.clone();
-            executor.spawn_indexed(
-                &mut join_set,
-                idx,
-                async move { make_request(request).await },
-            );
-        }
-
-        // Collect results and spawn replacements as tasks complete
         let mut indexed_results: Vec<(usize, T)> = Vec::with_capacity(num_requests);
         let mut had_panic = false;
         let batch_start = tokio::time::Instant::now();
         let log_interval = num_requests / 4; // Log at 25%, 50%, 75%
 
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok((idx, value)) => indexed_results.push((idx, value)),
-                Err(e) => {
-                    tracing::error!(
-                        "[{}] Task panicked in execute_concurrent_ordered: {:?}",
-                        chain,
-                        e
-                    );
-                    had_panic = true;
+        loop {
+            let can_spawn =
+                requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight;
+            let has_tasks = !join_set.is_empty();
+
+            if !can_spawn && !has_tasks {
+                break;
+            }
+
+            let collect_result = |indexed_results: &mut Vec<(usize, T)>,
+                                  had_panic: &mut bool,
+                                  result: Result<(usize, T), tokio::task::JoinError>| {
+                match result {
+                    Ok((idx, value)) => indexed_results.push((idx, value)),
+                    Err(e) => {
+                        tracing::error!(
+                            "[{}] Task panicked in execute_concurrent_ordered: {:?}",
+                            chain,
+                            e
+                        );
+                        *had_panic = true;
+                    }
                 }
-            }
+                if log_interval > 0
+                    && indexed_results.len().is_multiple_of(log_interval)
+                    && indexed_results.len() < num_requests
+                {
+                    tracing::debug!(
+                        "[{}] Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                        chain,
+                        indexed_results.len(),
+                        num_requests,
+                        indexed_results.len() as f64 / num_requests as f64 * 100.0,
+                        batch_start.elapsed().as_secs_f64()
+                    );
+                }
+            };
 
-            if log_interval > 0
-                && indexed_results.len().is_multiple_of(log_interval)
-                && indexed_results.len() < num_requests
-            {
-                tracing::debug!(
-                    "[{}] Batch progress: {}/{} ({:.0}%) in {:.1}s",
-                    chain,
-                    indexed_results.len(),
-                    num_requests,
-                    indexed_results.len() as f64 / num_requests as f64 * 100.0,
-                    batch_start.elapsed().as_secs_f64()
-                );
-            }
-
-            // Spawn replacements to keep the pipeline full
-            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-                let (idx, request) = requests_iter.next().unwrap();
-                let make_request = make_request.clone();
-                executor.spawn_indexed(
-                    &mut join_set,
-                    idx,
-                    async move { make_request(request).await },
-                );
+            match (can_spawn, has_tasks) {
+                (true, false) => {
+                    executor
+                        .rate_limiter
+                        .acquire_with_metrics(executor.cost_per_request, &chain)
+                        .await;
+                    let (idx, request) = requests_iter.next().unwrap();
+                    let make_request = make_request.clone();
+                    executor.spawn_indexed(
+                        &mut join_set,
+                        idx,
+                        async move { make_request(request).await },
+                    );
+                }
+                (false, true) => {
+                    if let Some(result) = join_set.join_next().await {
+                        collect_result(&mut indexed_results, &mut had_panic, result);
+                    }
+                }
+                (true, true) => {
+                    tokio::select! {
+                        Some(result) = join_set.join_next() => {
+                            collect_result(&mut indexed_results, &mut had_panic, result);
+                        }
+                        _ = executor.rate_limiter.acquire_with_metrics(executor.cost_per_request, &chain) => {
+                            let (idx, request) = requests_iter.next().unwrap();
+                            let make_request = make_request.clone();
+                            executor.spawn_indexed(
+                                &mut join_set,
+                                idx,
+                                async move { make_request(request).await },
+                            );
+                        }
+                    }
+                }
+                (false, false) => break,
             }
         }
 
@@ -583,7 +609,6 @@ impl AlchemyClient {
             ));
         }
 
-        // Sort by index and extract values
         indexed_results.sort_by_key(|(idx, _)| *idx);
         Ok(indexed_results.into_iter().map(|(_, v)| v).collect())
     }
@@ -620,30 +645,59 @@ impl AlchemyClient {
             let mut join_set = JoinSet::new();
             let mut requests_iter = requests.into_iter().peekable();
 
-            // Seed the initial batch up to the spawn window
-            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-                let request = requests_iter.next().unwrap();
-                let make_request = make_request.clone();
-                let result_tx = result_tx.clone();
-                executor.spawn_streaming(&mut join_set, result_tx, async move {
-                    make_request(request).await
-                });
-            }
+            loop {
+                let can_spawn =
+                    requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight;
+                let has_tasks = !join_set.is_empty();
 
-            // Wait for tasks to complete, spawning replacements to keep the pipeline full
-            while let Some(result) = join_set.join_next().await {
-                if let Err(e) = result {
-                    tracing::error!("[{}] Task panicked in execute_streaming: {:?}", chain, e);
+                if !can_spawn && !has_tasks {
+                    break;
                 }
 
-                // Spawn replacements
-                while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-                    let request = requests_iter.next().unwrap();
-                    let make_request = make_request.clone();
-                    let result_tx = result_tx.clone();
-                    executor.spawn_streaming(&mut join_set, result_tx, async move {
-                        make_request(request).await
-                    });
+                match (can_spawn, has_tasks) {
+                    (true, false) => {
+                        executor
+                            .rate_limiter
+                            .acquire_with_metrics(executor.cost_per_request, &chain)
+                            .await;
+                        let request = requests_iter.next().unwrap();
+                        let make_request = make_request.clone();
+                        let result_tx = result_tx.clone();
+                        executor.spawn_streaming(&mut join_set, result_tx, async move {
+                            make_request(request).await
+                        });
+                    }
+                    (false, true) => {
+                        if let Some(Err(e)) = join_set.join_next().await {
+                            tracing::error!(
+                                "[{}] Task panicked in execute_streaming: {:?}",
+                                chain,
+                                e
+                            );
+                        }
+                    }
+                    (true, true) => {
+                        tokio::select! {
+                            Some(result) = join_set.join_next() => {
+                                if let Err(e) = result {
+                                    tracing::error!(
+                                        "[{}] Task panicked in execute_streaming: {:?}",
+                                        chain,
+                                        e
+                                    );
+                                }
+                            }
+                            _ = executor.rate_limiter.acquire_with_metrics(executor.cost_per_request, &chain) => {
+                                let request = requests_iter.next().unwrap();
+                                let make_request = make_request.clone();
+                                let result_tx = result_tx.clone();
+                                executor.spawn_streaming(&mut join_set, result_tx, async move {
+                                    make_request(request).await
+                                });
+                            }
+                        }
+                    }
+                    (false, false) => break,
                 }
             }
         })
@@ -914,39 +968,72 @@ impl AlchemyClient {
             let mut join_set = tokio::task::JoinSet::new();
             let mut requests_iter = block_numbers.into_iter().enumerate().peekable();
 
-            // Seed initial batch
-            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-                let (idx, request) = requests_iter.next().unwrap();
-                let make_request = make_request.clone();
-                executor.spawn_indexed(
-                    &mut join_set,
-                    idx,
-                    async move { make_request(request).await },
-                );
-            }
-
             let mut indexed_results: Vec<(
                 usize,
                 Result<Vec<Option<TransactionReceipt>>, RpcError>,
             )> = Vec::with_capacity(num_requests);
 
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok((idx, value)) => indexed_results.push((idx, value)),
-                    Err(e) => {
-                        return Err(RpcError::ProviderError(format!(
-                            "Task panicked in get_block_receipts_concurrent: {:?}",
-                            e
-                        )));
-                    }
+            loop {
+                let can_spawn =
+                    requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight;
+                let has_tasks = !join_set.is_empty();
+
+                if !can_spawn && !has_tasks {
+                    break;
                 }
 
-                while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
-                    let (idx, request) = requests_iter.next().unwrap();
-                    let make_request = make_request.clone();
-                    executor.spawn_indexed(&mut join_set, idx, async move {
-                        make_request(request).await
-                    });
+                match (can_spawn, has_tasks) {
+                    (true, false) => {
+                        executor
+                            .rate_limiter
+                            .acquire_with_metrics(executor.cost_per_request, &chain)
+                            .await;
+                        let (idx, request) = requests_iter.next().unwrap();
+                        let make_request = make_request.clone();
+                        executor.spawn_indexed(
+                            &mut join_set,
+                            idx,
+                            async move { make_request(request).await },
+                        );
+                    }
+                    (false, true) => {
+                        if let Some(result) = join_set.join_next().await {
+                            match result {
+                                Ok((idx, value)) => indexed_results.push((idx, value)),
+                                Err(e) => {
+                                    return Err(RpcError::ProviderError(format!(
+                                        "Task panicked in get_block_receipts_concurrent: {:?}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    (true, true) => {
+                        tokio::select! {
+                            Some(result) = join_set.join_next() => {
+                                match result {
+                                    Ok((idx, value)) => indexed_results.push((idx, value)),
+                                    Err(e) => {
+                                        return Err(RpcError::ProviderError(format!(
+                                            "Task panicked in get_block_receipts_concurrent: {:?}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+                            _ = executor.rate_limiter.acquire_with_metrics(executor.cost_per_request, &chain) => {
+                                let (idx, request) = requests_iter.next().unwrap();
+                                let make_request = make_request.clone();
+                                executor.spawn_indexed(
+                                    &mut join_set,
+                                    idx,
+                                    async move { make_request(request).await },
+                                );
+                            }
+                        }
+                    }
+                    (false, false) => break,
                 }
             }
 
