@@ -160,7 +160,9 @@ impl ZoraCreateHandler {
                     block_timestamp: event.block_timestamp,
                     tx_id: event.evm_tx_hash_ref(),
                     creator_address: Some(payout_recipient.as_slice()),
-                    integrator: non_zero_address(platform_referrer).as_ref().map(|a| a.as_slice()),
+                    integrator: non_zero_address(platform_referrer)
+                        .as_ref()
+                        .map(|a| a.as_slice()),
                     token_address: &coin,
                     pool: Some(&PoolAddressOrPoolId::PoolId(pool_id)),
                     name: name.as_ref(),

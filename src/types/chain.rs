@@ -41,7 +41,7 @@ impl ChainAddress {
         false
     }
 
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         match self {
             Self::Evm(address) => format!("0x{}", hex::encode(address)),
             Self::Solana(pubkey) => hex::encode(pubkey),
@@ -69,7 +69,7 @@ impl ChainAddress {
         }
     }
 
-    pub fn to_vec(&self) -> Vec<u8> {
+    pub fn to_vec(self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
@@ -221,16 +221,13 @@ impl LogPosition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ChainType {
+    #[default]
     Evm,
     Solana,
 }
 
-impl Default for ChainType {
-    fn default() -> Self {
-        Self::Evm
-    }
-}
 
 #[cfg(test)]
 mod tests {

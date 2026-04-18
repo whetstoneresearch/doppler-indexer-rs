@@ -39,7 +39,6 @@ use crate::types::config::defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::shared::repair::RepairScope;
 use alloy::primitives::Address;
-use tokio::sync::oneshot;
 
 type EthCallJoinSet =
     tokio::task::JoinSet<Result<Option<(u64, u64, bool)>, EthCallCollectionError>>;

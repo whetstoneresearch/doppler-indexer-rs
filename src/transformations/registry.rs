@@ -1064,8 +1064,10 @@ pub fn build_registry_for_solana_chain(
     let mut registry =
         TransformationRegistry::with_source_and_chain_filter(available, ChainType::Solana);
 
-    // Solana transformation handlers will be registered here as they're implemented.
-    // For now, the registry is empty but properly source-filtered and chain-type-filtered.
+    crate::transformations::event::solana::cpmm::register_handlers(&mut registry);
+    crate::transformations::event::solana::initializer::register_handlers(&mut registry);
+    crate::transformations::event::solana::cpmm_migrator::register_handlers(&mut registry);
+    crate::transformations::event::solana::prediction::register_handlers(&mut registry);
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -1671,7 +1673,7 @@ mod tests {
     fn single_trigger_handler_is_not_multi_trigger() {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(mock_handler("A", vec![]));
-        assert!(!registry.is_multi_trigger(&"A_v1".to_string()));
+        assert!(!registry.is_multi_trigger("A_v1"));
     }
 
     #[test]

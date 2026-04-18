@@ -660,7 +660,7 @@ mod tests {
 
         // Future entry: resolved_at_block >= current_block  →  should NOT pass the guard
         assert!(
-            !(cached_resolved_at < current_block),
+            (cached_resolved_at >= current_block),
             "A path resolved at block {} should be rejected when current_block is {}",
             cached_resolved_at,
             current_block
@@ -669,7 +669,7 @@ mod tests {
         // Equal blocks: also rejected (resolved_at_block is NOT strictly less than current_block)
         let cached_resolved_at_equal = 100_u64;
         assert!(
-            !(cached_resolved_at_equal < current_block),
+            (cached_resolved_at_equal >= current_block),
             "A path resolved at the same block should also be rejected"
         );
 

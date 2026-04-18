@@ -4,6 +4,8 @@
 //! enabling the compaction service to know when ranges are ready.
 
 use std::collections::{HashMap, HashSet};
+
+type HandlerSetsFn<'a> = &'a mut dyn FnMut(&mut HashSet<String>, &mut HashSet<String>, &mut bool);
 use std::sync::Arc;
 
 use tokio_postgres::types::ToSql;
@@ -48,7 +50,7 @@ pub trait ProgressStatusStorage: Send + Sync {
     fn update_handler_sets_atomic(
         &self,
         number: u64,
-        update_fn: &mut dyn FnMut(&mut HashSet<String>, &mut HashSet<String>, &mut bool),
+        update_fn: HandlerSetsFn<'_>,
     ) -> Result<(), StorageError>;
 }
 
@@ -85,7 +87,7 @@ impl ProgressStatusStorage for LiveStorage {
     fn update_handler_sets_atomic(
         &self,
         number: u64,
-        update_fn: &mut dyn FnMut(&mut HashSet<String>, &mut HashSet<String>, &mut bool),
+        update_fn: HandlerSetsFn<'_>,
     ) -> Result<(), StorageError> {
         self.update_status_atomic(number, |status| {
             update_fn(

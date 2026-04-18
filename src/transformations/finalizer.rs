@@ -703,6 +703,25 @@ pub(crate) fn compute_fallback_deletes(
     result
 }
 
+/// Update the status file during finalization: prune stale failed handler keys,
+/// then set `transformed=true` only when no failures remain. This is the second
+/// half of the two-phase protocol — retry records handler outcomes, finalization
+/// gates the `transformed` flag.
+pub(crate) fn update_finalization_status(
+    storage: &dyn ProgressStatusStorage,
+    block_number: u64,
+    registered_keys: &HashSet<String>,
+) -> Result<(), StorageError> {
+    storage.update_handler_sets_atomic(block_number, &mut |_completed, failed, transformed| {
+        // Filter stale keys: only keep failed handlers that are still registered
+        failed.retain(|k| registered_keys.contains(k));
+
+        if failed.is_empty() {
+            *transformed = true;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,23 +917,4 @@ mod tests {
         let (_, blocks) = &fallbacks[0];
         assert_eq!(*blocks, vec![100u64, 101u64, 102u64]);
     }
-}
-
-/// Update the status file during finalization: prune stale failed handler keys,
-/// then set `transformed=true` only when no failures remain. This is the second
-/// half of the two-phase protocol — retry records handler outcomes, finalization
-/// gates the `transformed` flag.
-pub(crate) fn update_finalization_status(
-    storage: &dyn ProgressStatusStorage,
-    block_number: u64,
-    registered_keys: &HashSet<String>,
-) -> Result<(), StorageError> {
-    storage.update_handler_sets_atomic(block_number, &mut |_completed, failed, transformed| {
-        // Filter stale keys: only keep failed handlers that are still registered
-        failed.retain(|k| registered_keys.contains(k));
-
-        if failed.is_empty() {
-            *transformed = true;
-        }
-    })
 }
