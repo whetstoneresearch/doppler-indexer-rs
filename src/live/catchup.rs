@@ -250,7 +250,7 @@ impl LiveCatchupService {
             let block_num_i64 = block_number as i64;
             match db_pool
                 .query(
-                    "SELECT handler_key FROM _live_progress WHERE chain_id = $1 AND block_number = $2",
+                    "SELECT handler_key FROM _live_progress WHERE chain_id = $1 AND block_height = $2",
                     &[
                         &self.chain_id as &(dyn ToSql + Sync),
                         &block_num_i64 as &(dyn ToSql + Sync),

@@ -1031,7 +1031,7 @@ impl LiveCollector {
             let block_num = block_number as i64;
             db_pool
                 .query(
-                    "DELETE FROM _live_progress WHERE chain_id = $1 AND block_number = $2",
+                    "DELETE FROM _live_progress WHERE chain_id = $1 AND block_height = $2",
                     &[
                         &chain_id as &(dyn ToSql + Sync),
                         &block_num as &(dyn ToSql + Sync),

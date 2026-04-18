@@ -831,7 +831,7 @@ impl CompactionService {
         let rows = db_pool
             .query(
                 "SELECT DISTINCT handler_key FROM _live_progress
-                 WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3",
+                 WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3",
                 &[
                     &chain_id as &(dyn ToSql + Sync),
                     &start as &(dyn ToSql + Sync),
@@ -870,7 +870,7 @@ impl CompactionService {
         db_pool
             .query(
                 "DELETE FROM _live_progress
-                 WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3",
+                 WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3",
                 &[
                     &chain_id as &(dyn ToSql + Sync),
                     &start as &(dyn ToSql + Sync),
