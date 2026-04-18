@@ -796,9 +796,93 @@ fn build_array_from_decoded_values(
             Ok(Arc::new(arr))
         }
         EvmType::Named { inner, .. } => build_array_from_decoded_values(values, inner),
+        EvmType::Array(inner) => build_list_array_from_decoded_values(values, inner),
         _ => Err(EthCallDecodingError::Decode(format!(
             "Unsupported leaf type in build_array_from_decoded_values: {:?}",
             leaf_type
+        ))),
+    }
+}
+
+/// Build an Arrow ListArray from pre-extracted `Option<&DecodedValue>` slices where each value
+/// is expected to be `DecodedValue::Array(...)`. Used when an array-typed field appears as a
+/// leaf inside a flattened NamedTuple.
+fn build_list_array_from_decoded_values(
+    values: &[Option<&DecodedValue>],
+    inner_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    let element_vecs: Vec<Option<&Vec<DecodedValue>>> = values
+        .iter()
+        .map(|opt| match opt {
+            Some(DecodedValue::Array(arr)) => Some(arr),
+            _ => None,
+        })
+        .collect();
+
+    match inner_type {
+        EvmType::NamedTuple(_) | EvmType::UnnamedTuple(_) => {
+            let (field_names, field_types): (Vec<String>, Vec<&EvmType>) = match inner_type {
+                EvmType::NamedTuple(fields) => (
+                    fields.iter().map(|(n, _)| n.clone()).collect(),
+                    fields.iter().map(|(_, t)| t.as_ref()).collect(),
+                ),
+                EvmType::UnnamedTuple(fields) => (
+                    (0..fields.len()).map(|i| i.to_string()).collect(),
+                    fields.iter().collect(),
+                ),
+                _ => unreachable!(),
+            };
+
+            let arrow_fields: Vec<Field> = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, ty)| Field::new(name, ty.to_arrow_type(), true))
+                .collect();
+            let struct_fields: Fields = arrow_fields.into();
+
+            let mut all_struct_arrays: Vec<StructArray> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut current_offset: i32 = 0;
+
+            for arr_opt in &element_vecs {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        let struct_arr =
+                            build_decoded_value_struct(elem, &field_names, &field_types)?;
+                        all_struct_arrays.push(struct_arr);
+                        current_offset += 1;
+                    }
+                }
+                offsets.push(current_offset);
+            }
+
+            if all_struct_arrays.is_empty() {
+                let empty_struct = StructArray::new_null(struct_fields.clone(), 0);
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    Arc::new(empty_struct),
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            } else {
+                let struct_refs: Vec<&dyn Array> =
+                    all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
+                let concatenated = arrow::compute::concat(&struct_refs)?;
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    concatenated,
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            }
+        }
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Unsupported array element type in build_array_from_decoded_values: {:?}",
+            inner_type
         ))),
     }
 }
