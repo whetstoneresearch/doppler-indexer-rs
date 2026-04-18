@@ -235,6 +235,9 @@ pub(crate) fn extract_param_from_event(
         EventFieldLocation::V4PoolIdFromKeyData => {
             extract_v4_pool_id_from_key_data(trigger, param_type)
         }
+        EventFieldLocation::V4PoolKeyTupleFromData(offset) => {
+            extract_v4_pool_key_tuple_from_data(trigger, param_type, *offset)
+        }
     }
 }
 
@@ -274,6 +277,56 @@ fn extract_v4_pool_id_from_key_data(
 
     let encoded = DynSolValue::FixedBytes(pool_id, 32).abi_encode();
     Ok((DynSolValue::FixedBytes(pool_id, 32), encoded))
+}
+
+/// Extract a V4 PoolKey tuple (5 consecutive 32-byte words) from event data
+/// starting at the given word offset, and return it as a `DynSolValue::Tuple`
+/// with its ABI encoding.
+///
+/// The 5 words are:
+///   0: currency0 (address)
+///   1: currency1 (address)
+///   2: fee (uint24)
+///   3: tickSpacing (int24)
+///   4: hooks (address)
+fn extract_v4_pool_key_tuple_from_data(
+    trigger: &EventTriggerData,
+    _param_type: &EvmType,
+    offset: usize,
+) -> Result<(DynSolValue, Vec<u8>), EthCallCollectionError> {
+    let required_bytes = (offset + 5) * 32;
+    if trigger.data.len() < required_bytes {
+        return Err(EthCallCollectionError::EventParamExtraction(format!(
+            "v4_pool_key_tuple_from_data requires at least {} bytes of event data (offset={}, need 5 words), got {}",
+            required_bytes, offset, trigger.data.len()
+        )));
+    }
+
+    let word = |idx: usize| -> [u8; 32] {
+        let start = (offset + idx) * 32;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&trigger.data[start..start + 32]);
+        out
+    };
+
+    use alloy::primitives::{I256, U256};
+
+    let currency0 = Address::from(address_from_word(&word(0)));
+    let currency1 = Address::from(address_from_word(&word(1)));
+    let fee = uint24_from_word(&word(2));
+    let tick_spacing = int24_from_word(&word(3));
+    let hooks = Address::from(address_from_word(&word(4)));
+
+    let tuple = DynSolValue::Tuple(vec![
+        DynSolValue::Address(currency0),
+        DynSolValue::Address(currency1),
+        DynSolValue::Uint(U256::from(fee), 24),
+        DynSolValue::Int(I256::try_from(tick_spacing).unwrap_or_default(), 24),
+        DynSolValue::Address(hooks),
+    ]);
+
+    let encoded = tuple.abi_encode();
+    Ok((tuple, encoded))
 }
 
 fn address_from_word(word: &[u8; 32]) -> [u8; 20] {
@@ -1625,7 +1678,7 @@ mod tests {
     use crate::types::config::eth_call::{EventFieldLocation, EvmType};
     use crate::types::uniswap::v4::PoolKey;
     use alloy::dyn_abi::DynSolValue;
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, I256, U256};
     use alloy::sol;
     use alloy::sol_types::SolValue;
 
@@ -1682,5 +1735,81 @@ mod tests {
         .pool_id();
 
         assert_eq!(value, DynSolValue::FixedBytes(expected, 32));
+    }
+
+    #[test]
+    fn test_extract_param_from_event_v4_pool_key_tuple_from_data_with_offset() {
+        let currency0 = Address::from([0x11; 20]);
+        let currency1 = Address::from([0x22; 20]);
+        let hooks = Address::from([0x33; 20]);
+        let fee = 3000u32;
+        let tick_spacing = -60i32;
+
+        let mut data = vec![0xAA; 32];
+        data.extend(
+            TestPoolKey {
+                currency0,
+                currency1,
+                fee: fee.try_into().unwrap(),
+                tickSpacing: tick_spacing.try_into().unwrap(),
+                hooks,
+            }
+            .abi_encode(),
+        );
+
+        let trigger = EventTriggerData {
+            block_number: 100,
+            block_timestamp: 200,
+            log_index: 0,
+            emitter_address: [0u8; 20],
+            source_name: "test".to_string(),
+            event_signature: [0u8; 32],
+            topics: vec![[0u8; 32]],
+            data,
+        };
+
+        let (value, encoded) = extract_param_from_event(
+            &trigger,
+            &EventFieldLocation::V4PoolKeyTupleFromData(1),
+            &EvmType::Address,
+        )
+        .expect("pool key tuple extraction should succeed");
+
+        let expected = DynSolValue::Tuple(vec![
+            DynSolValue::Address(currency0),
+            DynSolValue::Address(currency1),
+            DynSolValue::Uint(U256::from(fee), 24),
+            DynSolValue::Int(I256::try_from(tick_spacing).unwrap_or_default(), 24),
+            DynSolValue::Address(hooks),
+        ]);
+
+        assert_eq!(value, expected);
+        assert_eq!(encoded, expected.abi_encode());
+    }
+
+    #[test]
+    fn test_extract_param_from_event_v4_pool_key_tuple_from_data_short_data_errors() {
+        let trigger = EventTriggerData {
+            block_number: 100,
+            block_timestamp: 200,
+            log_index: 0,
+            emitter_address: [0u8; 20],
+            source_name: "test".to_string(),
+            event_signature: [0u8; 32],
+            topics: vec![[0u8; 32]],
+            data: vec![0u8; 4 * 32],
+        };
+
+        let err = extract_param_from_event(
+            &trigger,
+            &EventFieldLocation::V4PoolKeyTupleFromData(0),
+            &EvmType::Address,
+        )
+        .expect_err("short event data should fail");
+
+        assert!(
+            err.to_string().contains("requires at least"),
+            "error should mention required data length: {err}"
+        );
     }
 }

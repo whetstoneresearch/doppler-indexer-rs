@@ -48,6 +48,24 @@
                     {
                         "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"
                     }
+                ],
+                "calls": [
+                    {
+                        "function": "getPoolCoin((address,address,uint24,int24,address))",
+                        "output_type": "(address coin, (int24 tickLower, int24 tickUpper, uint128 liquidity)[] positions)",
+                        "frequency": {
+                            "on_events": {
+                                "source": "ZoraCreatorCoinHook",
+                                "event": "Swapped(address,address,bool,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bool,bytes,uint160)"
+                            }
+                        },
+                        "params": [
+                            {
+                                "type": "(address,address,uint24,int24,address)",
+                                "from_event": "v4_pool_key_tuple_from_data:1"
+                            }
+                        ]
+                    }
                 ]
             },
             {
@@ -89,6 +107,24 @@
                 "events": [
                     {
                         "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"
+                    }
+                ],
+                "calls": [
+                    {
+                        "function": "getPoolCoin((address,address,uint24,int24,address))",
+                        "output_type": "(address coin, (int24 tickLower, int24 tickUpper, uint128 liquidity)[] positions)",
+                        "frequency": {
+                            "on_events": {
+                                "source": "ZoraContentCoinHook",
+                                "event": "Swapped(address,address,bool,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bool,bytes,uint160)"
+                            }
+                        },
+                        "params": [
+                            {
+                                "type": "(address,address,uint24,int24,address)",
+                                "from_event": "v4_pool_key_tuple_from_data:1"
+                            }
+                        ]
                     }
                 ]
             }

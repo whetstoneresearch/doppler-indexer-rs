@@ -227,6 +227,45 @@ pub struct UsdPriceContext {
 }
 
 impl UsdPriceContext {
+    /// Build a `UsdPriceContext` directly from the `prices` table.
+    ///
+    /// Seeds stablecoins at 1.0, queries ETH/USD and all token pair prices
+    /// from the DB up to `max_block`, and resolves transitively. Suitable
+    /// for backfill binaries that don't have a `TransformationContext`.
+    pub async fn build_from_db(
+        pool: &Pool,
+        chain_id: u64,
+        weth_address: Option<[u8; 20]>,
+        stablecoin_addresses: &[[u8; 20]],
+        max_block: Option<u64>,
+    ) -> Self {
+        let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
+
+        for addr in stablecoin_addresses {
+            resolved.insert(*addr, (BigDecimal::from(1), 0));
+        }
+
+        if let Some(weth_addr) = weth_address {
+            if let Ok((price, block)) =
+                query_latest_price(pool, chain_id, &weth_addr, Some(&USD_QUOTE_TOKEN), max_block)
+                    .await
+            {
+                resolved.insert(weth_addr, (price.clone(), block));
+                resolved.insert(ZERO_ADDRESS, (price, block));
+            }
+        }
+
+        if let Ok(raw) = query_all_latest_prices(pool, chain_id, max_block).await {
+            resolve_transitive_prices(&raw, &mut resolved);
+        }
+
+        let prices = resolved.into_iter().map(|(t, (p, _))| (t, p)).collect();
+        Self {
+            prices,
+            weth_address,
+        }
+    }
+
     /// Create a UsdPriceContext for testing.
     #[cfg(test)]
     pub fn new_for_test(

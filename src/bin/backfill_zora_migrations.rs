@@ -72,6 +72,19 @@ async fn main() -> anyhow::Result<()> {
         "done: total_rows={} inserted={} updated={} skipped={}",
         total_rows, inserted, updated, skipped
     );
+
+    let n = client
+        .execute(
+            "INSERT INTO _handler_progress (chain_id, handler_key, range_start, range_end) \
+             SELECT chain_id, 'ZoraMigrateHandler_v1', range_start, range_end \
+             FROM _handler_progress \
+             WHERE chain_id = $1 AND handler_key = 'ZoraCreateHandler_v1' \
+             ON CONFLICT (chain_id, handler_key, range_start) DO UPDATE SET range_end = EXCLUDED.range_end",
+            &[&CHAIN_ID],
+        )
+        .await?;
+    eprintln!("recorded {} ZoraMigrateHandler_v1 progress entries", n);
+
     Ok(())
 }
 
