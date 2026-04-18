@@ -2,7 +2,7 @@
 //!
 //! All V4 hook pool types (multicurve, decay_multicurve, scheduled_multicurve, dhook)
 //! share the same Swap event format and need getSlot0 call results for sqrtPriceX96/tick.
-//! ModifyLiquidity comes in two formats: tuple (multicurve, dhook) and flat (decay, scheduled).
+//! ModifyLiquidity comes in two formats: tuple (multicurve, dhook, decay_multicurve, scheduled_multicurve) and flat (legacy hooks).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -136,7 +136,7 @@ pub fn extract_v4_hook_tvl_targets(
     Ok(by_pool_block.into_values().collect())
 }
 
-/// Extract liquidity deltas from tuple-format ModifyLiquidity events (multicurve, dhook).
+/// Extract liquidity deltas from tuple-format ModifyLiquidity events (multicurve, dhook, decay_multicurve, scheduled_multicurve).
 ///
 /// Event signature: `ModifyLiquidity((PoolKey) key, (Params) params)`
 /// Pool ID is computed from PoolKey fields via keccak256.
@@ -169,7 +169,7 @@ pub fn extract_tuple_modify_liquidity(
     Ok(deltas)
 }
 
-/// Extract liquidity deltas from flat-format ModifyLiquidity events (decay, scheduled).
+/// Extract liquidity deltas from flat-format ModifyLiquidity events (legacy hooks only).
 ///
 /// Event signature: `ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)`
 /// Pool ID is directly available as the `id` field.
@@ -485,7 +485,7 @@ mod tests {
             transaction_hash: [0u8; 32],
             log_index: 7,
             contract_address: [0u8; 20],
-            source_name: "DecayMulticurveHook".to_string(),
+            source_name: "FlatFormatHook".to_string(),
             event_name: "ModifyLiquidity".to_string(),
             event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
                 .to_string(),
@@ -493,7 +493,7 @@ mod tests {
         };
 
         let ctx = make_test_ctx(vec![event], vec![]);
-        let result = extract_flat_modify_liquidity(&ctx, "DecayMulticurveHook").unwrap();
+        let result = extract_flat_modify_liquidity(&ctx, "FlatFormatHook").unwrap();
         assert_eq!(result.len(), 1);
 
         let delta = &result[0];

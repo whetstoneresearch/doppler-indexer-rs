@@ -16,7 +16,7 @@ use crate::transformations::event::metrics::swap_data::{
 };
 use crate::transformations::event::metrics::tvl::{process_tvl, TvlHandlerConfig};
 use crate::transformations::event::metrics::v4_hook_extract::{
-    extract_flat_modify_liquidity, extract_v4_hook_swaps, extract_v4_hook_tvl_targets,
+    extract_tuple_modify_liquidity, extract_v4_hook_swaps, extract_v4_hook_tvl_targets,
 };
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
@@ -164,7 +164,7 @@ impl TransformationHandler for DecayMulticurveLiquidityMetricsHandler {
         &self,
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
-        let deltas = extract_flat_modify_liquidity(ctx, SOURCE)?;
+        let deltas = extract_tuple_modify_liquidity(ctx, SOURCE)?;
         Ok(process_liquidity_deltas(&deltas, self.chain_id))
     }
 }
@@ -173,7 +173,7 @@ impl EventHandler for DecayMulticurveLiquidityMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
             SOURCE,
-            "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)",
+            "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))",
         )]
     }
 
