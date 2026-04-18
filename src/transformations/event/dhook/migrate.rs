@@ -187,7 +187,7 @@ impl EventHandler for DhookMigrationPoolCreateHandler {
     }
 
     fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
-        vec![dep("DopplerHookCreateHandler")]
+        vec![dep("DopplerHookCreateHandler").except([130, 57073])]
     }
 }
 
