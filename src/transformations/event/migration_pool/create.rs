@@ -164,6 +164,8 @@ impl TransformationHandler for MigrationPoolCreateHandler {
                     initializer,
                     fee: fee as u32,
                     migrated_from: &original_address,
+                    pool_type: "migration_v4",
+                    migration_type: "v4",
                 },
                 ctx,
             ));

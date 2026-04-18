@@ -76,7 +76,7 @@ pub fn sqrt_price_x96_to_price(
 }
 
 /// Multiply a BigDecimal by 10^exp (positive or negative).
-fn apply_decimal_exp(value: BigDecimal, exp: i32) -> BigDecimal {
+pub(crate) fn apply_decimal_exp(value: BigDecimal, exp: i32) -> BigDecimal {
     if exp == 0 {
         return value;
     }

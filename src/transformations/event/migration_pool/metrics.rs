@@ -32,9 +32,6 @@ use crate::transformations::event::metrics::swap_data::{
 };
 use crate::transformations::event::metrics::tvl::{process_tvl, TvlHandlerConfig, TvlTarget};
 use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modify_liquidity;
-use crate::transformations::event::migration_pool::create::{
-    MIGRATION_POOL_CREATE_HANDLER_NAME, MIGRATION_POOL_CREATE_HANDLER_VERSION,
-};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
@@ -73,14 +70,8 @@ impl MigrationPoolSwapMetricsHandler {
                 "SELECT p.address \
                  FROM pools p \
                  WHERE p.chain_id = $1 \
-                   AND p.migrated_from IS NOT NULL \
-                   AND p.source = $2 \
-                   AND p.source_version = $3",
-                &[
-                    &(self.chain_id as i64),
-                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
-                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
-                ],
+                   AND p.migrated_from IS NOT NULL",
+                &[&(self.chain_id as i64)],
             )
             .await?;
 
@@ -217,14 +208,8 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
                 "SELECT p.address \
                  FROM pools p \
                  WHERE p.chain_id = $1 \
-                   AND p.migrated_from IS NOT NULL \
-                   AND p.source = $2 \
-                   AND p.source_version = $3",
-                &[
-                    &(self.chain_id as i64),
-                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
-                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
-                ],
+                   AND p.migrated_from IS NOT NULL",
+                &[&(self.chain_id as i64)],
             )
             .await?;
 
@@ -252,7 +237,7 @@ impl EventHandler for MigrationPoolSwapMetricsHandler {
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["MigrationPoolCreateHandler"]
+        vec!["MigrationPoolCreateHandler", "DhookMigrationPoolCreateHandler"]
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
@@ -288,21 +273,28 @@ impl TransformationHandler for MigrationPoolLiquidityMetricsHandler {
         &self,
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
-        let deltas = extract_tuple_modify_liquidity(ctx, MIGRATOR_HOOK_SOURCE)?;
+        let mut deltas = extract_tuple_modify_liquidity(ctx, MIGRATOR_HOOK_SOURCE)?;
+        deltas.extend(extract_tuple_modify_liquidity(ctx, "DopplerHookMigrator")?);
         Ok(process_liquidity_deltas(&deltas, self.chain_id))
     }
 }
 
 impl EventHandler for MigrationPoolLiquidityMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
-        vec![EventTrigger::new(
-            MIGRATOR_HOOK_SOURCE,
-            "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))",
-        )]
+        vec![
+            EventTrigger::new(
+                MIGRATOR_HOOK_SOURCE,
+                "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))",
+            ),
+            EventTrigger::new(
+                "DopplerHookMigrator",
+                "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))",
+            ),
+        ]
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["MigrationPoolCreateHandler"]
+        vec!["MigrationPoolCreateHandler", "DhookMigrationPoolCreateHandler"]
     }
 }
 
@@ -329,14 +321,8 @@ impl MigrationPoolTvlMetricsHandler {
                 "SELECT p.address \
                  FROM pools p \
                  WHERE p.chain_id = $1 \
-                   AND p.migrated_from IS NOT NULL \
-                   AND p.source = $2 \
-                   AND p.source_version = $3",
-                &[
-                    &(self.chain_id as i64),
-                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
-                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
-                ],
+                   AND p.migrated_from IS NOT NULL",
+                &[&(self.chain_id as i64)],
             )
             .await?;
 
@@ -473,14 +459,8 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
                 "SELECT p.address \
                  FROM pools p \
                  WHERE p.chain_id = $1 \
-                   AND p.migrated_from IS NOT NULL \
-                   AND p.source = $2 \
-                   AND p.source_version = $3",
-                &[
-                    &(self.chain_id as i64),
-                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
-                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
-                ],
+                   AND p.migrated_from IS NOT NULL",
+                &[&(self.chain_id as i64)],
             )
             .await?;
 
@@ -510,6 +490,7 @@ impl EventHandler for MigrationPoolTvlMetricsHandler {
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec![
             "MigrationPoolCreateHandler",
+            "DhookMigrationPoolCreateHandler",
             "MigrationPoolLiquidityMetricsHandler",
         ]
     }
