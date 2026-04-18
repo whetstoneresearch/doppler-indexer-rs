@@ -681,29 +681,46 @@ async fn process_trigger_chunk<'a>(
                     addr
                 } else {
                     let emitter = Address::from(trigger.emitter_address);
+                    let is_cross_collection = config.contract_name != trigger.source_name;
                     match factory_addresses.get(&config.contract_name) {
                         Some(known_addresses) => {
                             if !known_addresses.contains(&emitter) {
-                                skipped.push(SkippedFactoryTrigger {
-                                    trigger: trigger.clone(),
-                                });
-                                tracing::debug!(
-                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
-                                    emitter,
-                                    config.contract_name
-                                );
+                                if is_cross_collection {
+                                    tracing::trace!(
+                                        "Skipping cross-collection event trigger: emitter {:?} from {} not in {}",
+                                        emitter,
+                                        trigger.source_name,
+                                        config.contract_name
+                                    );
+                                } else {
+                                    skipped.push(SkippedFactoryTrigger {
+                                        trigger: trigger.clone(),
+                                    });
+                                    tracing::debug!(
+                                        "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
+                                        emitter,
+                                        config.contract_name
+                                    );
+                                }
                                 continue;
                             }
                             emitter
                         }
                         None => {
-                            skipped.push(SkippedFactoryTrigger {
-                                trigger: trigger.clone(),
-                            });
-                            tracing::debug!(
-                                "Buffering event trigger for {}: no factory addresses loaded yet",
-                                config.contract_name
-                            );
+                            if is_cross_collection {
+                                tracing::trace!(
+                                    "Skipping cross-collection event trigger for {}: no factory addresses loaded yet",
+                                    config.contract_name
+                                );
+                            } else {
+                                skipped.push(SkippedFactoryTrigger {
+                                    trigger: trigger.clone(),
+                                });
+                                tracing::debug!(
+                                    "Buffering event trigger for {}: no factory addresses loaded yet",
+                                    config.contract_name
+                                );
+                            }
                             continue;
                         }
                     }
@@ -1162,29 +1179,46 @@ async fn process_trigger_chunk_multicall<'a>(
                     addr
                 } else {
                     let emitter = Address::from(trigger.emitter_address);
+                    let is_cross_collection = config.contract_name != trigger.source_name;
                     match factory_addresses.get(&config.contract_name) {
                         Some(known_addresses) => {
                             if !known_addresses.contains(&emitter) {
-                                skipped.push(SkippedFactoryTrigger {
-                                    trigger: trigger.clone(),
-                                });
-                                tracing::debug!(
-                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
-                                    emitter,
-                                    config.contract_name
-                                );
+                                if is_cross_collection {
+                                    tracing::trace!(
+                                        "Skipping cross-collection event trigger: emitter {:?} from {} not in {}",
+                                        emitter,
+                                        trigger.source_name,
+                                        config.contract_name
+                                    );
+                                } else {
+                                    skipped.push(SkippedFactoryTrigger {
+                                        trigger: trigger.clone(),
+                                    });
+                                    tracing::debug!(
+                                        "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
+                                        emitter,
+                                        config.contract_name
+                                    );
+                                }
                                 continue;
                             }
                             emitter
                         }
                         None => {
-                            skipped.push(SkippedFactoryTrigger {
-                                trigger: trigger.clone(),
-                            });
-                            tracing::debug!(
-                                "Buffering event trigger for {}: no factory addresses loaded yet",
-                                config.contract_name
-                            );
+                            if is_cross_collection {
+                                tracing::trace!(
+                                    "Skipping cross-collection event trigger for {}: no factory addresses loaded yet",
+                                    config.contract_name
+                                );
+                            } else {
+                                skipped.push(SkippedFactoryTrigger {
+                                    trigger: trigger.clone(),
+                                });
+                                tracing::debug!(
+                                    "Buffering event trigger for {}: no factory addresses loaded yet",
+                                    config.contract_name
+                                );
+                            }
                             continue;
                         }
                     }
