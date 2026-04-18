@@ -853,11 +853,15 @@ fn build_live_decoder_destinations(
     Option<mpsc::Sender<DecodedEventsMessage>>,
 ) {
     let event_decoder_dest = if has_discovery {
-        discovery_events_tx
+        discovery_events_tx.clone()
     } else {
         transform_events_tx.clone()
     };
-    let instruction_decoder_dest = transform_events_tx;
+    let instruction_decoder_dest = if has_discovery {
+        discovery_events_tx
+    } else {
+        transform_events_tx
+    };
 
     (event_decoder_dest, instruction_decoder_dest)
 }
@@ -1765,6 +1769,104 @@ pub async fn process_solana_chain_live_only(
     run_solana_live_mode(config, &runtime).await
 }
 
+/// Re-run transformation catchup for a Solana chain using existing decoded
+/// parquet output only.
+pub async fn transform_only_solana_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    shared_db_pool: Option<Arc<DbPool>>,
+    handler_filter: Option<&HashSet<String>>,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        chain = chain.name.as_str(),
+        "Transformation-only mode for Solana chain"
+    );
+
+    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
+
+    if !runtime.transformations_enabled {
+        tracing::info!(
+            chain = chain.name.as_str(),
+            "No transformation handlers registered for chain, nothing to do"
+        );
+        return Ok(());
+    }
+
+    let mut registry = build_registry_for_solana_chain(chain.chain_id, &chain.solana_programs);
+    if let Some(names) = handler_filter {
+        registry.filter_to_handlers(names);
+    }
+
+    if registry.is_empty() {
+        tracing::info!(
+            chain = chain.name.as_str(),
+            "No transformation handlers remain after filtering, nothing to do"
+        );
+        return Ok(());
+    }
+
+    let tc = config.transformations.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("transformations config required for --transformation-only mode")
+    })?;
+
+    let mode = if tc.mode.batch_for_catchup {
+        ExecutionMode::Batch {
+            batch_size: tc.mode.catchup_batch_size,
+        }
+    } else {
+        ExecutionMode::Streaming
+    };
+
+    let registry = Arc::new(registry);
+    let engine = TransformationEngine::new(
+        registry.clone(),
+        runtime
+            .db_pool
+            .clone()
+            .expect("transformations_enabled requires db"),
+        None,
+        TransformationEngineConfig {
+            chain_name: chain.name.clone(),
+            chain_id: chain.chain_id,
+            mode,
+            contracts: Contracts::new(),
+            factory_collections: FactoryCollections::new(),
+            handler_concurrency: tc.handler_concurrency,
+            expect_log_completion: false,
+            expect_eth_call_completion: false,
+            expect_account_state_completion: false,
+            expect_instruction_completion: false,
+            from_block: chain.from_block,
+            to_block: chain.to_block,
+        },
+        None,
+    )
+    .await
+    .context("failed to create transformation engine")?;
+
+    engine
+        .initialize()
+        .await
+        .context("failed to initialize transformation handlers")?;
+
+    tracing::info!(
+        chain = chain.name.as_str(),
+        handlers = registry.handler_count(),
+        "Running Solana transformation catchup"
+    );
+
+    engine
+        .run_catchup()
+        .await
+        .map_err(|e| anyhow::anyhow!("transformation catchup error: {}", e))?;
+
+    tracing::info!(
+        chain = chain.name.as_str(),
+        "Transformation-only processing complete for Solana chain"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Decode-only pipeline
 // ---------------------------------------------------------------------------
@@ -2299,9 +2401,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_decoder_destinations_keep_instructions_out_of_discovery_bridge() {
+    async fn live_decoder_destinations_route_instructions_through_discovery_bridge() {
         let (transform_tx, mut transform_rx) = mpsc::channel(1);
-        let (bridge_tx, mut bridge_rx) = mpsc::channel(1);
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(2);
 
         let (event_tx, instruction_tx) =
             build_live_decoder_destinations(true, Some(transform_tx), Some(bridge_tx));
@@ -2329,11 +2431,11 @@ mod tests {
             .await
             .unwrap();
 
-        let bridged = bridge_rx.recv().await.unwrap();
-        let transformed = transform_rx.recv().await.unwrap();
+        let bridged_first = bridge_rx.recv().await.unwrap();
+        let bridged_second = bridge_rx.recv().await.unwrap();
 
-        assert_eq!(bridged.event_name, "Swap");
-        assert_eq!(transformed.event_name, "Transfer");
+        assert_eq!(bridged_first.event_name, "Swap");
+        assert_eq!(bridged_second.event_name, "Transfer");
         assert!(bridge_rx.try_recv().is_err());
         assert!(transform_rx.try_recv().is_err());
     }

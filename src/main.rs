@@ -643,64 +643,77 @@ async fn main() -> anyhow::Result<()> {
             let result = {
                 // Dispatch by chain type: Solana chains use a separate pipeline
                 #[cfg(feature = "solana")]
-                if chain.chain_type == types::chain::ChainType::Solana {
-                    if live_only {
+                if transformation_only {
+                    if chain.chain_type == types::chain::ChainType::Solana {
+                        solana::pipeline::transform_only_solana_chain(
+                            &config,
+                            &chain,
+                            shared_db_pool,
+                            transformation_handlers.as_ref(),
+                        )
+                        .await
+                    } else {
+                        transformation_only_chain(
+                            &config,
+                            &chain,
+                            shared_db_pool,
+                            transformation_handlers.as_ref(),
+                        )
+                        .await
+                    }
+                } else if live_only {
+                    if chain.chain_type == types::chain::ChainType::Solana {
                         solana::pipeline::process_solana_chain_live_only(
                             &config,
                             &chain,
                             shared_db_pool,
                         )
                         .await
-                    } else if repair_only {
-                        tracing::warn!(
-                            chain = chain.name.as_str(),
-                            "Repair mode not yet supported for Solana chains"
-                        );
-                        Ok(())
-                    } else if decode_only {
-                        solana::pipeline::decode_only_solana_chain(&config, &chain, repair_scope)
-                            .await
                     } else {
-                        solana::pipeline::process_solana_chain(
+                        process_chain_live_only(
                             &config,
                             &chain,
-                            catch_up_only,
-                            repair,
-                            repair_scope,
                             shared_db_pool,
+                            shared_rate_limiter,
+                            transformation_handlers.as_ref(),
                         )
                         .await
                     }
-                } else if transformation_only {
-                    transformation_only_chain(
-                        &config,
-                        &chain,
-                        shared_db_pool,
-                        transformation_handlers.as_ref(),
-                    )
-                    .await
-                } else if live_only {
-                    process_chain_live_only(
-                        &config,
-                        &chain,
-                        shared_db_pool,
-                        shared_rate_limiter,
-                        transformation_handlers.as_ref(),
-                    )
-                    .await
                 } else if repair_only {
-                    repair_only_chain(
-                        &config,
-                        &chain,
-                        storage_manager,
-                        repair_scope,
-                        shared_rate_limiter,
-                    )
-                    .await
+                    if chain.chain_type == types::chain::ChainType::Solana {
+                        Err(anyhow::anyhow!(
+                            "Repair-only mode is not yet supported for Solana chain {}",
+                            chain.name
+                        ))
+                    } else {
+                        repair_only_chain(
+                            &config,
+                            &chain,
+                            storage_manager,
+                            repair_scope,
+                            shared_rate_limiter,
+                        )
+                        .await
+                    }
                 } else if repair_factories {
                     repair_factories_chain(&config, &chain, storage_manager).await
                 } else if decode_only {
-                    decode_only_chain(&config, &chain, repair, repair_scope).await
+                    if chain.chain_type == types::chain::ChainType::Solana {
+                        solana::pipeline::decode_only_solana_chain(&config, &chain, repair_scope)
+                            .await
+                    } else {
+                        decode_only_chain(&config, &chain, repair, repair_scope).await
+                    }
+                } else if chain.chain_type == types::chain::ChainType::Solana {
+                    solana::pipeline::process_solana_chain(
+                        &config,
+                        &chain,
+                        catch_up_only,
+                        repair,
+                        repair_scope,
+                        shared_db_pool,
+                    )
+                    .await
                 } else {
                     process_chain(
                         &config,

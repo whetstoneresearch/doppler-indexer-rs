@@ -228,7 +228,6 @@ pub enum ChainType {
     Solana,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
