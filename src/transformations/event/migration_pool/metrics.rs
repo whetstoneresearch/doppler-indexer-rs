@@ -33,7 +33,9 @@ use crate::transformations::event::metrics::swap_data::{
 use crate::transformations::event::metrics::tvl::{process_tvl, TvlHandlerConfig, TvlTarget};
 use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modify_liquidity;
 use crate::transformations::registry::TransformationRegistry;
-use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+use crate::transformations::traits::{
+    dep, EventHandler, EventTrigger, HandlerDependencySpec, TransformationHandler,
+};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::usd_price::{
     build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
@@ -236,8 +238,13 @@ impl EventHandler for MigrationPoolSwapMetricsHandler {
         )]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["MigrationPoolCreateHandler", "DhookMigrationPoolCreateHandler"]
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        vec![
+            // Only chains with UniswapV4Migrator (monad=143 and ink=57073 lack it)
+            dep("MigrationPoolCreateHandler").except([143, 57073]),
+            // Only chains with DopplerHookMigrator (unichain=130 and ink=57073 lack it)
+            dep("DhookMigrationPoolCreateHandler").except([130, 57073]),
+        ]
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
@@ -293,8 +300,11 @@ impl EventHandler for MigrationPoolLiquidityMetricsHandler {
         ]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["MigrationPoolCreateHandler", "DhookMigrationPoolCreateHandler"]
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        vec![
+            dep("MigrationPoolCreateHandler").except([143, 57073]),
+            dep("DhookMigrationPoolCreateHandler").except([130, 57073]),
+        ]
     }
 }
 
@@ -487,11 +497,12 @@ impl EventHandler for MigrationPoolTvlMetricsHandler {
         )]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
         vec![
-            "MigrationPoolCreateHandler",
-            "DhookMigrationPoolCreateHandler",
-            "MigrationPoolLiquidityMetricsHandler",
+            dep("MigrationPoolCreateHandler").except([143, 57073]),
+            dep("DhookMigrationPoolCreateHandler").except([130, 57073]),
+            // Only chains where both UniswapV4MigratorHook and DopplerHookMigrator exist
+            dep("MigrationPoolLiquidityMetricsHandler").only([1, 8453, 11155111, 84532]),
         ]
     }
 
