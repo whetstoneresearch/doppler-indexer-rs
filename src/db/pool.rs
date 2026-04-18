@@ -3,7 +3,10 @@ use std::time::Instant;
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use metrics::{counter, histogram};
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use rand::Rng;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
@@ -30,7 +33,18 @@ impl DbPool {
             recycling_method: RecyclingMethod::Fast,
         };
 
-        let manager = Manager::from_config(config, NoTls, manager_config);
+        let ssl_mode = config.get_ssl_mode();
+        let manager = match ssl_mode {
+            SslMode::Disable => {
+                tracing::info!("Database TLS disabled by connection string (sslmode=disable)");
+                Manager::from_config(config, NoTls, manager_config)
+            }
+            _ => {
+                let tls_connector = build_tls_connector()?;
+                tracing::info!(ssl_mode = ?ssl_mode, "Database TLS enabled");
+                Manager::from_config(config, tls_connector, manager_config)
+            }
+        };
 
         let pool = Pool::builder(manager)
             .max_size(pool_size)
@@ -326,6 +340,14 @@ impl DbPool {
 
         extract_row_result(&rows)
     }
+}
+
+fn build_tls_connector() -> Result<MakeTlsConnector, DbError> {
+    let tls_connector = TlsConnector::builder()
+        .build()
+        .map_err(|e| DbError::ConfigError(format!("failed to build database TLS connector: {e}")))?;
+
+    Ok(MakeTlsConnector::new(tls_connector))
 }
 
 /// Check whether a `DbError` is a PostgreSQL deadlock (SQLSTATE 40P01).

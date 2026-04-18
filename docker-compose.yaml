@@ -3,6 +3,15 @@ services:
     image: postgres:16-alpine
     container_name: doppler-indexer-db
     shm_size: 1g
+    command: >
+      postgres
+      -c max_connections=500
+      -c shared_buffers=512MB
+      -c work_mem=4MB
+      -c wal_buffers=64MB
+      -c checkpoint_completion_target=0.9
+      -c synchronous_commit=off
+      -c max_wal_size=4GB
     environment:
       POSTGRES_USER: doppler
       POSTGRES_PASSWORD: doppler
