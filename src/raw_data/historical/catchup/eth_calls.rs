@@ -116,17 +116,27 @@ pub(crate) async fn process_event_triggered_catchup_range(
     let range_start = log_range.start;
     let inclusive_end = log_range.end - 1;
     let factory_range_key = range_key(range_start, inclusive_end);
-    let ready_factory_sources_for_range: HashSet<String> = ctx
-        .factory_collections
-        .iter()
-        .filter(|collection_name| {
-            ctx.factory_contract_indexes
-                .get(*collection_name)
-                .is_some_and(|index| index.contains_key(&factory_range_key))
-                && ctx.factory_addresses.contains_key(*collection_name)
-        })
-        .cloned()
-        .collect();
+    // In repair mode factory_contract_indexes is always empty (no factory stream), so we
+    // consider any collection with loaded addresses as "ready" for all ranges — the parquet
+    // load already merged addresses from every historical range.
+    let ready_factory_sources_for_range: HashSet<String> = if ctx.repair {
+        ctx.factory_collections
+            .iter()
+            .filter(|c| ctx.factory_addresses.contains_key(*c))
+            .cloned()
+            .collect()
+    } else {
+        ctx.factory_collections
+            .iter()
+            .filter(|collection_name| {
+                ctx.factory_contract_indexes
+                    .get(*collection_name)
+                    .is_some_and(|index| index.contains_key(&factory_range_key))
+                    && ctx.factory_addresses.contains_key(*collection_name)
+            })
+            .cloned()
+            .collect()
+    };
 
     // === Skip check (non-repair only) ===
     if !ctx.repair {
