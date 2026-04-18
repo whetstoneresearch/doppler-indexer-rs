@@ -98,11 +98,7 @@ impl TransformationHandler for CurveSwapHandler {
                     DbValue::Null,
                     DbValue::Int64(log_position),
                 ],
-                conflict_columns: vec![
-                    "chain_id".into(),
-                    "tx_id".into(),
-                    "log_position".into(),
-                ],
+                conflict_columns: vec!["chain_id".into(), "tx_id".into(), "log_position".into()],
                 update_columns: vec![],
                 update_condition: None,
             });

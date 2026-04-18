@@ -188,11 +188,7 @@ impl TransformationHandler for CpmmMetricsHandler {
                     DbValue::Numeric(acc.volume1.to_string()),
                     DbValue::Int32(acc.swap_count),
                 ],
-                conflict_columns: vec![
-                    "chain_id".into(),
-                    "pool_id".into(),
-                    "block_height".into(),
-                ],
+                conflict_columns: vec!["chain_id".into(), "pool_id".into(), "block_height".into()],
                 update_columns: vec![
                     "price_open".into(),
                     "price_close".into(),

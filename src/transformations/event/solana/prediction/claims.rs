@@ -75,11 +75,7 @@ impl TransformationHandler for PredictionClaimHandler {
                     DbValue::Uint64(reward_amount),
                     DbValue::Uint64(total_burned),
                 ],
-                conflict_columns: vec![
-                    "chain_id".into(),
-                    "tx_id".into(),
-                    "log_position".into(),
-                ],
+                conflict_columns: vec!["chain_id".into(), "tx_id".into(), "log_position".into()],
                 update_columns: vec![],
                 update_condition: None,
             });
@@ -91,7 +87,10 @@ impl TransformationHandler for PredictionClaimHandler {
 
 impl EventHandler for PredictionClaimHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
-        vec![EventTrigger::new("DopplerPredictionMigrator", "RewardsClaimed")]
+        vec![EventTrigger::new(
+            "DopplerPredictionMigrator",
+            "RewardsClaimed",
+        )]
     }
 }
 

@@ -67,11 +67,7 @@ impl TransformationHandler for PredictionEntryHandler {
                     DbValue::Null,
                     DbValue::Null,
                 ],
-                conflict_columns: vec![
-                    "chain_id".into(),
-                    "market".into(),
-                    "entry_id".into(),
-                ],
+                conflict_columns: vec!["chain_id".into(), "market".into(), "entry_id".into()],
                 update_columns: vec![],
                 update_condition: None,
             });
@@ -109,11 +105,7 @@ impl TransformationHandler for PredictionEntryHandler {
                     DbValue::Uint64(contribution),
                     DbValue::Bool(is_winner),
                 ],
-                conflict_columns: vec![
-                    "chain_id".into(),
-                    "market".into(),
-                    "entry_id".into(),
-                ],
+                conflict_columns: vec!["chain_id".into(), "market".into(), "entry_id".into()],
                 update_columns: vec!["contribution".into(), "is_winner".into()],
                 update_condition: None,
             });

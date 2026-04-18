@@ -125,10 +125,7 @@ async fn process_file(
                 .await?;
 
             let Some(row) = rows.first() else {
-                eprintln!(
-                    "  skip: no pool for from_hash={}",
-                    hex::encode(from_hash)
-                );
+                eprintln!("  skip: no pool for from_hash={}", hex::encode(from_hash));
                 *skipped += 1;
                 continue;
             };
@@ -220,38 +217,53 @@ fn col_binary<'a>(
     batch: &'a arrow::record_batch::RecordBatch,
     name: &str,
 ) -> &'a FixedSizeBinaryArray {
-    let idx = batch.schema().index_of(name).unwrap_or_else(|_| {
-        panic!("column '{}' not found in parquet schema", name)
-    });
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .unwrap_or_else(|_| panic!("column '{}' not found in parquet schema", name));
     let col = batch.column(idx);
     col.as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .unwrap_or_else(|| panic!("column '{}' is not FixedSizeBinaryArray (type={:?})", name, col.data_type()))
+        .unwrap_or_else(|| {
+            panic!(
+                "column '{}' is not FixedSizeBinaryArray (type={:?})",
+                name,
+                col.data_type()
+            )
+        })
 }
 
-fn col_u64<'a>(
-    batch: &'a arrow::record_batch::RecordBatch,
-    name: &str,
-) -> &'a UInt64Array {
-    let idx = batch.schema().index_of(name).unwrap_or_else(|_| {
-        panic!("column '{}' not found in parquet schema", name)
-    });
+fn col_u64<'a>(batch: &'a arrow::record_batch::RecordBatch, name: &str) -> &'a UInt64Array {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .unwrap_or_else(|_| panic!("column '{}' not found in parquet schema", name));
     let col = batch.column(idx);
     // ubigint in DuckDB parquet maps to UInt64 in arrow.
     col.as_any()
         .downcast_ref::<UInt64Array>()
-        .unwrap_or_else(|| panic!("column '{}' is not UInt64Array (type={:?})", name, col.data_type()))
+        .unwrap_or_else(|| {
+            panic!(
+                "column '{}' is not UInt64Array (type={:?})",
+                name,
+                col.data_type()
+            )
+        })
 }
 
-fn col_i64<'a>(
-    batch: &'a arrow::record_batch::RecordBatch,
-    name: &str,
-) -> &'a Int64Array {
-    let idx = batch.schema().index_of(name).unwrap_or_else(|_| {
-        panic!("column '{}' not found in parquet schema", name)
-    });
+fn col_i64<'a>(batch: &'a arrow::record_batch::RecordBatch, name: &str) -> &'a Int64Array {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .unwrap_or_else(|_| panic!("column '{}' not found in parquet schema", name));
     let col = batch.column(idx);
     col.as_any()
         .downcast_ref::<Int64Array>()
-        .unwrap_or_else(|| panic!("column '{}' is not Int64Array (type={:?})", name, col.data_type()))
+        .unwrap_or_else(|| {
+            panic!(
+                "column '{}' is not Int64Array (type={:?})",
+                name,
+                col.data_type()
+            )
+        })
 }
