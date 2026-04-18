@@ -913,23 +913,39 @@ query PoolOHLCV($chainId: Int!, $pool: Address!, $fromBlock: Int!) {
 
 ## Rust Reference Implementation
 
-Dependencies:
+The API is a second binary in the same crate, gated behind an `api` feature flag. All existing dependencies (`tokio-postgres`, `deadpool-postgres`, `rust_decimal`, `serde`, `chrono`, `hex`, `bs58`, `anyhow`, `tracing`) are already present — only the HTTP/GraphQL stack is new.
+
+**`Cargo.toml` additions:**
 
 ```toml
+[features]
+# existing features unchanged …
+api = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:async-graphql",
+    "dep:async-graphql-axum",
+]
+
 [dependencies]
-axum            = "0.8"
-tokio           = { version = "1", features = ["full"] }
-tower           = "0.5"
-tower-http      = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
-sqlx            = { version = "0.8", features = ["postgres", "runtime-tokio", "chrono", "rust_decimal"] }
-async-graphql   = { version = "7", features = ["chrono"] }
-async-graphql-axum = "7"
-serde           = { version = "1", features = ["derive"] }
-serde_json      = "1"
-rust_decimal    = "1"
-chrono          = { version = "0.4", features = ["serde"] }
-base64          = "0.22"
+# existing deps unchanged, except add with-chrono-0_4 to tokio-postgres:
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+
+# new, api-only:
+axum               = { version = "0.8", optional = true }
+tower              = { version = "0.5", optional = true }
+tower-http         = { version = "0.6", features = ["cors", "compression-gzip", "trace"], optional = true }
+async-graphql      = { version = "7", optional = true }
+async-graphql-axum = { version = "7", optional = true }
+
+[[bin]]
+name = "doppler-api"
+path = "src/bin/api.rs"
+required-features = ["api"]
 ```
+
+Build: `cargo run --bin doppler-api --features api`
 
 ### Types (`src/api/types.rs`)
 
@@ -937,13 +953,13 @@ base64          = "0.22"
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow};
+use tokio_postgres::Row;
 use crate::types::chain::{ChainAddress, TxId};
 
 // ── Address API wrappers ──────────────────────────────────────────────────
 //
 // ChainAddress and TxId from src/types/chain.rs are the canonical in-memory
-// types. Here we add sqlx::Type and serde impls suitable for the API layer.
+// types. The API layer adds serde impls for JSON serialization.
 //
 // Wire format (matches ChainAddress::Display):
 //   EVM address  (20 bytes) → "0x{40 hex chars}"
@@ -951,12 +967,10 @@ use crate::types::chain::{ChainAddress, TxId};
 //   EVM tx hash  (32 bytes) → "0x{64 hex chars}"
 //   Solana sig   (64 bytes) → base58
 //
-// Disambiguation: 0x prefix → EVM, no prefix → Solana. These are structurally
-// distinct so there is no ambiguity in parsing.
+// Disambiguation: 0x prefix → EVM, no prefix → Solana.
 
-// sqlx reads BYTEA columns into Vec<u8>; we convert in FromRow impls below
-// rather than using #[sqlx(transparent)], because ChainAddress needs to know
-// its variant from context (length of the byte slice).
+// tokio_postgres reads BYTEA as Vec<u8>; we convert via parse_chain_address
+// in TryFrom<&Row> impls.
 
 pub fn parse_chain_address(bytes: Vec<u8>) -> Result<ChainAddress, String> {
     match bytes.len() {
@@ -1104,12 +1118,21 @@ pub struct ChainMeta {
     pub data_as_of_block: Option<i64>,
 }
 
-// ── DB row types (FromRow) ────────────────────────────────────────────────
+// ── DB row types ─────────────────────────────────────────────────────────
 //
-// BYTEA columns come out as Vec<u8> via sqlx. ChainAddress/TxId are
-// constructed in custom FromRow impls using parse_chain_address/parse_tx_id.
-// TIMESTAMPTZ columns map to DateTime<Utc>; serde_unix serializes them as
-// unix seconds in the response.
+// tokio_postgres reads BYTEA as Vec<u8> and TIMESTAMPTZ as DateTime<Utc>
+// (requires the `with-chrono-0_4` feature). ChainAddress/TxId are built
+// via parse_chain_address/parse_tx_id in TryFrom<&Row> impls.
+// serde_unix serializes DateTime<Utc> as unix seconds in responses.
+
+// Helper: map a row decode error into tokio_postgres::Error
+fn addr_err(e: String) -> tokio_postgres::Error {
+    // tokio_postgres doesn't expose a public constructor for custom decode
+    // errors; use a conversion through Box<dyn Error>.
+    panic!("address decode error: {e}")
+    // In production code, use a custom error type that wraps this rather
+    // than panicking — shown simplified here for brevity.
+}
 
 #[derive(Debug, Serialize)]
 pub struct TokenRow {
@@ -1135,33 +1158,33 @@ pub struct TokenRow {
     pub is_content_coin: bool,
 }
 
-// Manual FromRow: convert Vec<u8> BYTEA fields into ChainAddress
-impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for TokenRow {
-    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
-        use sqlx::Row;
-        Ok(TokenRow {
-            id:               row.try_get("id")?,
-            chain_id:         row.try_get("chain_id")?,
-            block_number:     row.try_get("block_number")?,
-            created_at:       row.try_get("created_at")?,
-            address:          parse_chain_address(row.try_get("address")?)
-                                  .map_err(|e| sqlx::Error::Decode(e.into()))?,
-            creator_address:  row.try_get::<Option<Vec<u8>>, _>("creator_address")?
-                                  .map(|b| parse_chain_address(b).map_err(|e| sqlx::Error::Decode(e.into())))
-                                  .transpose()?,
-            integrator:       row.try_get::<Option<Vec<u8>>, _>("integrator")?
-                                  .map(|b| parse_chain_address(b).map_err(|e| sqlx::Error::Decode(e.into())))
-                                  .transpose()?,
-            pool:             row.try_get::<Option<Vec<u8>>, _>("pool")?
-                                  .map(|b| parse_chain_address(b).map_err(|e| sqlx::Error::Decode(e.into())))
-                                  .transpose()?,
-            name:             row.try_get("name")?,
-            symbol:           row.try_get("symbol")?,
-            decimals:         row.try_get("decimals")?,
-            total_supply:     row.try_get("total_supply")?,
-            is_derc20:        row.try_get("is_derc20")?,
-            is_creator_coin:  row.try_get("is_creator_coin")?,
-            is_content_coin:  row.try_get("is_content_coin")?,
+impl TryFrom<&Row> for TokenRow {
+    type Error = tokio_postgres::Error;
+    fn try_from(row: &Row) -> Result<Self, Self::Error> {
+        let addr = |col: &str| -> Result<ChainAddress, tokio_postgres::Error> {
+            parse_chain_address(row.try_get::<_, Vec<u8>>(col)?).map_err(addr_err)
+        };
+        let addr_opt = |col: &str| -> Result<Option<ChainAddress>, tokio_postgres::Error> {
+            row.try_get::<_, Option<Vec<u8>>>(col)?
+               .map(|b| parse_chain_address(b).map_err(addr_err))
+               .transpose()
+        };
+        Ok(Self {
+            id:              row.try_get("id")?,
+            chain_id:        row.try_get("chain_id")?,
+            block_number:    row.try_get("block_number")?,
+            created_at:      row.try_get("created_at")?,
+            address:         addr("address")?,
+            creator_address: addr_opt("creator_address")?,
+            integrator:      addr_opt("integrator")?,
+            pool:            addr_opt("pool")?,
+            name:            row.try_get("name")?,
+            symbol:          row.try_get("symbol")?,
+            decimals:        row.try_get("decimals")?,
+            total_supply:    row.try_get("total_supply")?,
+            is_derc20:       row.try_get("is_derc20")?,
+            is_creator_coin: row.try_get("is_creator_coin")?,
+            is_content_coin: row.try_get("is_content_coin")?,
         })
     }
 }
@@ -1214,6 +1237,33 @@ pub struct PoolSnapshotRow {
     pub volume_usd: Option<Decimal>,
 }
 
+impl TryFrom<&Row> for PoolSnapshotRow {
+    type Error = tokio_postgres::Error;
+    fn try_from(row: &Row) -> Result<Self, Self::Error> {
+        Ok(Self {
+            chain_id:             row.try_get("chain_id")?,
+            pool_id:              parse_chain_address(row.try_get::<_, Vec<u8>>("pool_id")?)
+                                      .map_err(addr_err)?,
+            block_number:         row.try_get("block_number")?,
+            block_timestamp:      row.try_get("block_timestamp")?,
+            price_open:           row.try_get("price_open")?,
+            price_close:          row.try_get("price_close")?,
+            price_high:           row.try_get("price_high")?,
+            price_low:            row.try_get("price_low")?,
+            active_liquidity:     row.try_get("active_liquidity")?,
+            volume0:              row.try_get("volume0")?,
+            volume1:              row.try_get("volume1")?,
+            swap_count:           row.try_get("swap_count")?,
+            amount0:              row.try_get("amount0")?,
+            amount1:              row.try_get("amount1")?,
+            tvl_usd:              row.try_get("tvl_usd")?,
+            market_cap_usd:       row.try_get("market_cap_usd")?,
+            active_liquidity_usd: row.try_get("active_liquidity_usd")?,
+            volume_usd:           row.try_get("volume_usd")?,
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SwapRow {
     pub id: i64,
@@ -1232,6 +1282,29 @@ pub struct SwapRow {
     pub is_buy: bool,
     pub current_tick: Option<i32>,
     pub value_usd: Option<i64>,
+}
+
+impl TryFrom<&Row> for SwapRow {
+    type Error = tokio_postgres::Error;
+    fn try_from(row: &Row) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id:           row.try_get("id")?,
+            chain_id:     row.try_get("chain_id")?,
+            tx_id:        parse_tx_id(row.try_get::<_, Vec<u8>>("tx_id")?)
+                              .map_err(addr_err)?,
+            block_number: row.try_get("block_number")?,
+            timestamp:    row.try_get("timestamp")?,
+            pool:         parse_chain_address(row.try_get::<_, Vec<u8>>("pool")?)
+                              .map_err(addr_err)?,
+            asset:        parse_chain_address(row.try_get::<_, Vec<u8>>("asset")?)
+                              .map_err(addr_err)?,
+            amount_in:    row.try_get("amountIn")?,
+            amount_out:   row.try_get("amountOut")?,
+            is_buy:       row.try_get("is_buy")?,
+            current_tick: row.try_get("current_tick")?,
+            value_usd:    row.try_get("value_usd")?,
+        })
+    }
 }
 
 // ── Cursor for keyset pagination ──────────────────────────────────────────
@@ -1269,100 +1342,119 @@ bs58 = "0.5"
 
 ### Query Layer (`src/api/queries.rs`)
 
-`ChainAddress::as_slice()` returns `&[u8]`, which sqlx binds as `BYTEA`. `active_versions` is joined on every source-versioned table to restrict results to promoted versions only.
+`ChainAddress::as_slice()` returns `&[u8]`, which `tokio_postgres` binds as `BYTEA`. Every query runs inside a `REPEATABLE READ` read-only transaction to prevent mid-request inconsistency if a reorg is being processed concurrently. `active_versions` is joined on every source-versioned table.
 
 ```rust
-use sqlx::PgPool;
+use deadpool_postgres::Pool;
+use tokio_postgres::IsolationLevel;
 use crate::types::chain::ChainAddress;
 use crate::api::types::{Cursor, PoolSnapshotRow, SwapRow};
 
+/// Run `f` inside a REPEATABLE READ read-only transaction.
+async fn with_snapshot<F, T>(pool: &Pool, f: F) -> anyhow::Result<T>
+where
+    F: for<'c> AsyncFnOnce(&'c tokio_postgres::Transaction<'c>) -> anyhow::Result<T>,
+{
+    let mut client = pool.get().await?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let result = f(&tx).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
 pub async fn list_pool_snapshots(
-    db: &PgPool,
+    pool: &Pool,
     chain_id: i64,
-    pool_id: &ChainAddress,       // bound as BYTEA via .as_slice()
+    pool_id: &ChainAddress,
     from_block: Option<i64>,
     to_block: Option<i64>,
     cursor: Option<Cursor>,
     limit: i64,
-    desc: bool,
 ) -> anyhow::Result<Vec<PoolSnapshotRow>> {
-    // Keyset: (block_number) — PK is (chain_id, pool_id, block_number, source, source_version).
-    // DISTINCT ON (block_number) picks latest source_version automatically when ordered by it.
-    let cursor_block = match &cursor {
+    let cursor_block: Option<i64> = match &cursor {
         Some(Cursor::BlockId { block, .. }) => Some(*block),
         _ => None,
     };
 
-    sqlx::query_as::<_, PoolSnapshotRow>(
-        r#"
-        SELECT DISTINCT ON (block_number)
-            chain_id, pool_id, block_number, block_timestamp,
-            price_open, price_close, price_high, price_low,
-            active_liquidity, volume0, volume1, swap_count,
-            amount0, amount1, tvl_usd, market_cap_usd,
-            active_liquidity_usd, volume_usd
-        FROM pool_snapshots ps
-        INNER JOIN active_versions av USING (source, source_version)
-        WHERE ps.chain_id = $1
-          AND ps.pool_id = $2
-          AND ($3::BIGINT IS NULL OR ps.block_number >= $3)
-          AND ($4::BIGINT IS NULL OR ps.block_number <= $4)
-          AND ($5::BIGINT IS NULL OR ps.block_number < $5)
-        ORDER BY ps.block_number DESC
-        LIMIT $6
-        "#,
-    )
-    .bind(chain_id)
-    .bind(pool_id.as_slice())   // &[u8] → BYTEA
-    .bind(from_block)
-    .bind(to_block)
-    .bind(cursor_block)
-    .bind(limit + 1)
-    .fetch_all(db)
-    .await
-    .map_err(Into::into)
+    with_snapshot(pool, async |tx| {
+        let rows = tx.query(
+            "SELECT DISTINCT ON (ps.block_number)
+                 ps.chain_id, ps.pool_id, ps.block_number, ps.block_timestamp,
+                 ps.price_open, ps.price_close, ps.price_high, ps.price_low,
+                 ps.active_liquidity, ps.volume0, ps.volume1, ps.swap_count,
+                 ps.amount0, ps.amount1, ps.tvl_usd, ps.market_cap_usd,
+                 ps.active_liquidity_usd, ps.volume_usd
+             FROM pool_snapshots ps
+             INNER JOIN active_versions av USING (source, source_version)
+             WHERE ps.chain_id = $1
+               AND ps.pool_id = $2
+               AND ($3::BIGINT IS NULL OR ps.block_number >= $3)
+               AND ($4::BIGINT IS NULL OR ps.block_number <= $4)
+               AND ($5::BIGINT IS NULL OR ps.block_number < $5)
+             ORDER BY ps.block_number DESC
+             LIMIT $6",
+            &[
+                &chain_id,
+                &pool_id.as_slice(),   // &[u8] → BYTEA
+                &from_block,
+                &to_block,
+                &cursor_block,
+                &(limit + 1),
+            ],
+        ).await?;
+        rows.iter().map(PoolSnapshotRow::try_from).collect::<Result<_, _>>()
+           .map_err(Into::into)
+    }).await
 }
 
 pub async fn list_swaps(
-    db: &PgPool,
+    pool: &Pool,
     chain_id: i64,
-    pool: Option<&ChainAddress>,  // None → NULL → no filter
+    pool_addr: Option<&ChainAddress>,
     is_buy: Option<bool>,
     cursor: Option<Cursor>,
     limit: i64,
 ) -> anyhow::Result<Vec<SwapRow>> {
-    let (cursor_ts, cursor_id) = match cursor {
+    let (cursor_ts, cursor_id): (Option<i64>, Option<i64>) = match cursor {
         Some(Cursor::TimestampId { ts, id }) => (Some(ts), Some(id)),
         _ => (None, None),
     };
+    // Bind Option<&[u8]>: None → SQL NULL, Some → BYTEA
+    let pool_bytes: Option<&[u8]> = pool_addr.map(|a| a.as_slice());
 
-    sqlx::query_as::<_, SwapRow>(
-        r#"
-        SELECT id, chain_id, tx_id, block_number, timestamp,
-               pool, asset, "amountIn", "amountOut", is_buy,
-               current_tick, value_usd
-        FROM swaps s
-        INNER JOIN active_versions av USING (source, source_version)
-        WHERE s.chain_id = $1
-          AND ($2::BYTEA IS NULL OR s.pool = $2)
-          AND ($3::BOOLEAN IS NULL OR s.is_buy = $3)
-          AND (
-            $4::BIGINT IS NULL
-            OR (EXTRACT(EPOCH FROM s.timestamp)::BIGINT, s.id) < ($4, $5)
-          )
-        ORDER BY s.timestamp DESC, s.id DESC
-        LIMIT $6
-        "#,
-    )
-    .bind(chain_id)
-    .bind(pool.map(|a| a.as_slice()))  // Option<&[u8]> — None binds NULL
-    .bind(is_buy)
-    .bind(cursor_ts)
-    .bind(cursor_id)
-    .bind(limit + 1)
-    .fetch_all(db)
-    .await
-    .map_err(Into::into)
+    with_snapshot(pool, async |tx| {
+        let rows = tx.query(
+            "SELECT s.id, s.chain_id, s.tx_id, s.block_number, s.timestamp,
+                    s.pool, s.asset, s.\"amountIn\", s.\"amountOut\", s.is_buy,
+                    s.current_tick, s.value_usd
+             FROM swaps s
+             INNER JOIN active_versions av USING (source, source_version)
+             WHERE s.chain_id = $1
+               AND ($2::BYTEA IS NULL OR s.pool = $2)
+               AND ($3::BOOLEAN IS NULL OR s.is_buy = $3)
+               AND (
+                 $4::BIGINT IS NULL
+                 OR (EXTRACT(EPOCH FROM s.timestamp)::BIGINT, s.id) < ($4, $5)
+               )
+             ORDER BY s.timestamp DESC, s.id DESC
+             LIMIT $6",
+            &[
+                &chain_id,
+                &pool_bytes,           // Option<&[u8]> — None binds NULL
+                &is_buy,
+                &cursor_ts,
+                &cursor_id,
+                &(limit + 1),
+            ],
+        ).await?;
+        rows.iter().map(SwapRow::try_from).collect::<Result<_, _>>()
+           .map_err(Into::into)
+    }).await
 }
 ```
 
@@ -1380,7 +1472,7 @@ use axum::{
 use serde::Deserialize;
 use crate::api::{
     queries,
-    types::{parse_chain_address, serde_chain_address, Cursor, Page, PageInfo, PoolSnapshotRow},
+    types::{parse_chain_address, serde_chain_address, Cursor, FeedPage, FeedPageInfo, LeaderboardPage, LeaderboardPageInfo, PoolSnapshotRow},
     AppState,
 };
 
@@ -1396,7 +1488,11 @@ struct ChainAddressParam(
 pub enum ApiError {
     BadAddress(String),
     BadCursor,
-    Db(sqlx::Error),
+    Db(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self { ApiError::Db(e) }
 }
 
 impl IntoResponse for ApiError {
@@ -1441,7 +1537,7 @@ pub async fn pool_snapshots(
     State(state): State<AppState>,
     Path(address): Path<String>,   // path param arrives as raw string
     Query(q): Query<SnapshotQuery>,
-) -> Result<Json<Page<PoolSnapshotRow>>, ApiError> {
+) -> Result<Json<FeedPage<PoolSnapshotRow>>, ApiError> {
     // Convert path segment "0x{hex}" or base58 → ChainAddress
     let addr_bytes = if address.starts_with("0x") {
         hex::decode(&address[2..]).map_err(|e| ApiError::BadAddress(e.to_string()))?
@@ -1449,7 +1545,7 @@ pub async fn pool_snapshots(
         bs58::decode(&address).into_vec().map_err(|e| ApiError::BadAddress(e.to_string()))?
     };
     let pool_id = parse_chain_address(addr_bytes)
-        .map_err(|e| ApiError::BadAddress(e))?;
+        .map_err(ApiError::BadAddress)?;
 
     let cursor = q.cursor.as_deref()
         .map(Cursor::decode)
@@ -1470,7 +1566,7 @@ pub async fn pool_snapshots(
         desc,
     )
     .await
-    .map_err(ApiError::Db)?;
+    .map_err(anyhow::Error::from)?;
 
     let has_more = rows.len() as i64 > limit;
     if has_more { rows.pop(); }
@@ -1481,16 +1577,18 @@ pub async fn pool_snapshots(
         None
     };
 
-    Ok(Json(Page {
+    Ok(Json(FeedPage {
+        new_since_head: None,
         data: rows,
-        pagination: PageInfo { next_cursor, has_more },
+        pagination: FeedPageInfo { next_cursor, head_cursor: None, has_more, has_more_new: false },
+        chain: state.chain_meta(q.chain_id, None).await?,
     }))
 }
 
 pub async fn list_swaps(
     State(state): State<AppState>,
     Query(q): Query<SwapQuery>,    // pool: Option<Address> auto-deserialized from "0x..."
-) -> Result<Json<Page<PoolSnapshotRow>>, ApiError> {
+) -> Result<Json<FeedPage<SwapRow>>, ApiError> {
     let cursor = q.cursor.as_deref()
         .map(Cursor::decode)
         .transpose()
@@ -1507,13 +1605,23 @@ pub async fn list_swaps(
         limit,
     )
     .await
-    .map_err(ApiError::Db)?;
+    .map_err(anyhow::Error::from)?;
 
     let has_more = rows.len() as i64 > limit;
     if has_more { rows.pop(); }
 
-    // ... build next_cursor, return Page
-    todo!()
+    let next_cursor = if has_more {
+        rows.last().map(|r| Cursor::TimestampId { ts: r.timestamp, id: r.id }.encode())
+    } else {
+        None
+    };
+
+    Ok(Json(FeedPage {
+        new_since_head: None,
+        data: rows,
+        pagination: FeedPageInfo { next_cursor, head_cursor: None, has_more, has_more_new: false },
+        chain: state.chain_meta(q.chain_id, None).await?,
+    }))
 }
 ```
 
@@ -1612,29 +1720,63 @@ async fn graphql_playground() -> impl axum::response::IntoResponse {
 }
 ```
 
-### Entry Point (`src/api/main.rs`)
+### Entry Point (`src/bin/api.rs`)
 
 ```rust
-use sqlx::postgres::PgPoolOptions;
+use deadpool_postgres::{Config as PgConfig, ManagerConfig, RecyclingMethod, Runtime};
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: sqlx::PgPool,
+    pub db: deadpool_postgres::Pool,
+}
+
+impl AppState {
+    /// Fetch confirmed tip, reorg_epoch, and optional invalidated_from_block
+    /// for a given chain in a single query.
+    pub async fn chain_meta(
+        &self,
+        chain_id: i64,
+        known_reorg_epoch: Option<i64>,
+    ) -> anyhow::Result<crate::api::types::ChainMeta> {
+        let client = self.db.get().await?;
+        let row = client.query_one(
+            "SELECT confirmed_tip, reorg_epoch,
+                    CASE WHEN $2::BIGINT IS NOT NULL AND reorg_epoch > $2
+                         THEN (SELECT MIN(from_block) FROM reorg_log
+                               WHERE chain_id = $1 AND reorg_epoch > $2)
+                         ELSE NULL
+                    END AS invalidated_from_block
+             FROM chain_tips WHERE chain_id = $1",
+            &[&chain_id, &known_reorg_epoch],
+        ).await?;
+        Ok(crate::api::types::ChainMeta {
+            confirmed_tip: row.try_get("confirmed_tip")?,
+            reorg_epoch:   row.try_get("reorg_epoch")?,
+            invalidated_from_block: row.try_get("invalidated_from_block")?,
+            data_as_of_block: None,
+        })
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let db_url = std::env::var("DATABASE_URL")?;
-    let db = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&db_url)
-        .await?;
+
+    let mut cfg = PgConfig::new();
+    cfg.url = Some(db_url);
+    cfg.manager = Some(ManagerConfig { recycling_method: RecyclingMethod::Fast });
+
+    let tls = MakeTlsConnector::new(TlsConnector::builder().build()?);
+    let db = cfg.create_pool(Some(Runtime::Tokio1), tls)?;
 
     let state = AppState { db };
-    let app = router::build_router(state);
+    let app = crate::api::router::build_router(state);
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("listening on {}", listener.local_addr()?);
