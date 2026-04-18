@@ -118,9 +118,63 @@ New arrivals always land at the "top" (DESC) or strictly after the current posit
 
 Used by endpoints sorted by a value that changes as the indexer processes new blocks (`active_liquidity_usd`, `tvl_usd`, etc.). Examples: `GET /v1/pools`.
 
-Sort key drift — a pool moving from rank 50 to rank 3 mid-session — is unavoidable with keyset pagination on mutable columns. The solution is **session snapshot isolation**: the cursor carries a `snapshot_block` captured from `MAX(block_number)` in `pool_state` on the first page. Subsequent pages add `AND pool_state.block_number <= $snapshot_block` to the state join, pinning rankings to the moment the session started.
+Sort key drift — a pool moving from rank 50 to rank 3 mid-session — is unavoidable when ranking directly against the live, UPSERTed `pool_state` table. The solution is **versioned ranking snapshots**: the indexer periodically materializes a point-in-time ranking into `pool_leaderboard_snapshot`, keyed by a monotonic `snapshot_id`. The first page captures `MAX(snapshot_id)` into the cursor and every subsequent page reads the same snapshot. Keyset seeks run against a composite index `(chain_id, sort_key, snapshot_id, sort_val DESC, id DESC)` — every page is `O(log N + limit)` regardless of depth, and rankings are perfectly stable for the life of the session.
 
-To get fresh rankings the client starts a new session (no cursor). The response includes `data_as_of_block` so clients can display a staleness indicator.
+Old snapshots are garbage-collected after a retention window (default 1 hour). If a client's cursor references an expired `snapshot_id` the server returns `INVALID_CURSOR` and the client restarts the session. To get fresh rankings the client starts a new session (no cursor); the response includes `data_as_of_block` (the block height the snapshot was taken at) so clients can display a staleness indicator.
+
+**Snapshot table**
+
+```sql
+CREATE SEQUENCE pool_leaderboard_snapshot_id_seq;
+
+CREATE TABLE pool_leaderboard_snapshot (
+    snapshot_id   BIGINT      NOT NULL,
+    chain_id      BIGINT      NOT NULL,
+    sort_key      TEXT        NOT NULL,   -- 'active_liquidity_usd', 'tvl_usd', ...
+    pool_id       BYTEA       NOT NULL,
+    id            BIGINT      NOT NULL,   -- pools.id, used as keyset tiebreaker
+    sort_val      NUMERIC,                -- nullable: pools with no state sort last
+    block_height  BIGINT      NOT NULL,   -- the pool_state block this row reflects
+    taken_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (snapshot_id, chain_id, sort_key, pool_id)
+);
+
+CREATE INDEX idx_plsnap_keyset
+    ON pool_leaderboard_snapshot (chain_id, sort_key, snapshot_id, sort_val DESC NULLS LAST, id DESC);
+CREATE INDEX idx_plsnap_reorg ON pool_leaderboard_snapshot (chain_id, block_height);
+CREATE INDEX idx_plsnap_gc    ON pool_leaderboard_snapshot (taken_at);
+```
+
+**Indexer write path.** After every N processed blocks (or every T seconds — configurable; defaults 100 blocks / 30 s) the indexer materializes one new snapshot covering every supported `sort_key`. In the implementation the snapshot id is pulled via `SELECT nextval(...)` and then passed as a bound parameter to one `INSERT ... SELECT` per sort key, all inside a single transaction; the shape below is the equivalent single-statement form:
+
+```sql
+WITH sid AS (SELECT nextval('pool_leaderboard_snapshot_id_seq') AS snapshot_id)
+INSERT INTO pool_leaderboard_snapshot
+    (snapshot_id, chain_id, sort_key, pool_id, id, sort_val, block_height)
+SELECT sid.snapshot_id, ps.chain_id, k.sort_key, ps.pool_id, p.id,
+       CASE k.sort_key
+           WHEN 'active_liquidity_usd' THEN ps.active_liquidity_usd
+           WHEN 'tvl_usd'              THEN ps.tvl_usd
+           WHEN 'volume_24h_usd'       THEN ps.volume_24h_usd
+           WHEN 'market_cap_usd'       THEN ps.market_cap_usd
+       END,
+       ps.block_height
+FROM   pool_state ps
+INNER JOIN active_versions av
+    ON av.source = ps.source AND av.active_version = ps.source_version
+INNER JOIN pools p
+    ON p.chain_id = ps.chain_id
+   AND p.address  = ps.pool_id
+   AND p.source   = ps.source
+   AND p.source_version = ps.source_version
+CROSS JOIN sid
+CROSS JOIN (VALUES ('active_liquidity_usd'), ('tvl_usd'),
+                   ('volume_24h_usd'),       ('market_cap_usd')) AS k(sort_key);
+```
+
+A separate background job runs `DELETE FROM pool_leaderboard_snapshot WHERE taken_at < now() - INTERVAL '1 hour'`. Snapshot cadence and retention are per-deployment knobs; shorter cadence means fresher new-session rankings at the cost of write amplification.
+
+**Reorg handling.** If a reorg invalidates blocks at or after a snapshot's `block_height`, the indexer deletes that snapshot on reorg processing — any still-active cursor pointing at it falls back to `INVALID_CURSOR` on the next request, forcing the client to restart with current data. This keeps the snapshot table aligned with the canonical chain without needing per-row reconciliation.
 
 **Request parameters**
 
@@ -148,7 +202,7 @@ To get fresh rankings the client starts a new session (no cursor). The response 
 }
 ```
 
-**Cursor encoding** — `{ "val": "<decimal_string>", "id": <bigint>, "snapshot_block": <bigint> }`. Decimal string preserves `NUMERIC` precision. `snapshot_block` is forwarded on each page to enforce the session snapshot.
+**Cursor encoding** — `{ "val": "<decimal_string>", "id": <bigint>, "snapshot_id": <bigint> }`. Decimal string preserves `NUMERIC` precision. `snapshot_id` pins all subsequent page reads to the same materialized ranking; if it has been GC'd the server returns `INVALID_CURSOR`.
 
 ---
 
@@ -287,9 +341,15 @@ Temporal feed of newly created pools, sorted by `(block_number DESC, id DESC)`. 
 
 #### `GET /v1/pools`
 
-Ranked pool leaderboard. Sort keys are mutable; uses **leaderboard pagination** with session snapshot isolation. No `head_cursor` — start a new session to get fresh rankings.
+Ranked pool leaderboard. Sort keys are mutable; uses **leaderboard pagination** backed by the `pool_leaderboard_snapshot` table. No `head_cursor` — start a new session (no cursor) to pick up the latest snapshot.
 
-The query does `LEFT JOIN pool_state USING (chain_id, pool_id)` filtered through `active_versions`. Pools with no state row sort last.
+All four sort modes share one query shape: the read is always keyset seek on `(chain_id, sort_key, snapshot_id, sort_val, id)`, where `sort_key` is the string-literal column name (`'active_liquidity_usd'`, `'tvl_usd'`, `'volume_24h_usd'`, `'market_cap_usd'`). The composite index `idx_plsnap_keyset` covers every mode equally — there is no per-sort-mode query.
+
+The first page resolves `snapshot_id = (SELECT MAX(snapshot_id) FROM pool_leaderboard_snapshot WHERE chain_id = $1 AND sort_key = $2)` and joins to `pools` / `pool_state` for the full response object. Subsequent pages reuse the `snapshot_id` carried in the cursor. Pools whose `sort_val` is null in the snapshot sort last under `order=desc` and first under `order=asc` — the index is declared `DESC NULLS LAST`, and Postgres scans it backwards with flipped null ordering for ASC.
+
+**Direction**. For `order=desc` (default), the keyset predicate is `(sort_val, id) < ($cursor_val, $cursor_id)` with `ORDER BY sort_val DESC NULLS LAST, id DESC`. For `order=asc`, the predicate flips to `(sort_val, id) > ($cursor_val, $cursor_id)` with `ORDER BY sort_val ASC NULLS FIRST, id ASC`. Both shapes use `idx_plsnap_keyset` — the ASC case via a backward index scan — so neither introduces a sort.
+
+**Filter interaction**. `base_token`, `quote_token`, `type`, and `migrated` are columns on `pools`, not on the snapshot. The query applies them in the join to `pools` *after* the keyset seek on the snapshot. For highly selective filters (e.g. a `quote_token` matching 1% of pools) the server may need to scan many snapshot rows before assembling a full `limit`-sized page; the server caps this post-filter scan at an internal multiplier of `limit` to bound worst-case latency, returning `has_more=true` whenever the cap is hit so the cursor still advances. Clients with highly selective filters should expect more pages with fewer rows rather than a single full page.
 
 **Query Parameters**
 
@@ -302,13 +362,17 @@ The query does `LEFT JOIN pool_state USING (chain_id, pool_id)` filtered through
 | `migrated`          | boolean | Filter: has `migrated_at` set                                                         |
 | `sort_by`           | enum    | `active_liquidity_usd` (default), `tvl_usd`, `volume_24h_usd`, `market_cap_usd`      |
 | `order`             | enum    | `desc` (default), `asc`                                                               |
-| `cursor`            | string  | Opaque leaderboard cursor (encodes sort value + id + snapshot_block)                  |
+| `cursor`            | string  | Opaque leaderboard cursor (encodes sort value + id + snapshot_id)                     |
 | `limit`             | integer | Default 50, max 500                                                                   |
 | `known_reorg_epoch` | integer | See Reorg Safety                                                                      |
 
-Sort semantics:
+Sort semantics (all read from `pool_leaderboard_snapshot.sort_val` where `sort_key = '<column>'`):
 - `active_liquidity_usd`: in-range liquidity only. For constant-product pools this equals TVL; for v4/CLMM pools it reflects only liquidity currently earning fees — a meaningfully different signal.
-- `tvl_usd`, `volume_24h_usd`, `market_cap_usd`: same join, ordered by the respective `pool_state` column.
+- `tvl_usd`: total value locked in the pool, at snapshot capture time.
+- `volume_24h_usd`: trailing 24-hour swap volume in USD.
+- `market_cap_usd`: token market cap at snapshot capture time.
+
+`sort_val` reflects the `pool_state` column value at the block the snapshot was taken (`chain.data_as_of_block`), not the live value. Within one session all rankings are frozen to that block.
 
 **Response** uses the leaderboard envelope (`data`, `pagination.next_cursor`, `chain.data_as_of_block`).
 
@@ -1113,7 +1177,7 @@ pub struct ChainMeta {
     pub reorg_epoch: i64,
     /// Non-null when reorg_epoch advanced since the client's known_reorg_epoch.
     pub invalidated_from_block: Option<i64>,
-    /// Leaderboard only: pool_state block used for sort key snapshot.
+    /// Leaderboard only: block_number the active ranking snapshot was captured at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_as_of_block: Option<i64>,
 }
@@ -1317,8 +1381,9 @@ pub enum Cursor {
     /// Time-ordered endpoints (swaps, prices).
     TimestampId { ts: i64, id: i64 },
     /// Leaderboard endpoints: sort by mutable value column.
-    /// snapshot_block pins the pool_state join for session consistency.
-    ValId { val: Decimal, id: i64, snapshot_block: i64 },
+    /// snapshot_id pins reads to a single row in pool_leaderboard_snapshot
+    /// for session consistency; expires with the snapshot's retention window.
+    ValId { val: Decimal, id: i64, snapshot_id: i64 },
 }
 
 impl Cursor {
