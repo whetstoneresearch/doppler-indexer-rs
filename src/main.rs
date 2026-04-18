@@ -46,7 +46,7 @@ use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageMa
 use transformations::{
     ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
 };
-use types::config::chain::ChainConfig;
+use types::config::chain::{ChainConfig, ProviderType};
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use types::config::indexer::IndexerConfig;
 use types::config::raw_data::RawDataCollectionConfig;
@@ -66,6 +66,23 @@ fn optional_channel<T>(
     } else {
         (None, None)
     }
+}
+
+/// Resolve the effective provider type for a chain, consulting the rate_limit_group
+/// config when the chain belongs to one (group provider supersedes chain-level provider).
+fn resolve_provider(config: &IndexerConfig, chain: &ChainConfig) -> ProviderType {
+    if let Some(ref group_name) = chain.rpc.rate_limit_group {
+        if let Some(group) = config
+            .rpc_rate_limits
+            .as_ref()
+            .and_then(|groups| groups.get(group_name))
+        {
+            if let Some(ref p) = group.provider {
+                return p.clone();
+            }
+        }
+    }
+    chain.rpc.provider.clone().unwrap_or_default()
 }
 
 fn collect_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String>> {
@@ -920,7 +937,9 @@ async fn transformation_only_chain(
         .batch_size
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(types::config::defaults::rpc::MAX_BATCH_SIZE) as usize;
-    let (_rate_limiter, rpc_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+    let use_alchemy = resolve_provider(config, chain) == ProviderType::Alchemy;
+    let (_rate_limiter, rpc_client) =
+        build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size, use_alchemy)?;
 
     // Validate call dependencies
     transformations::registry::validate_call_dependencies(
@@ -1014,12 +1033,18 @@ async fn repair_only_chain(
         .batch_size
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
+    let use_alchemy = resolve_provider(config, chain) == ProviderType::Alchemy;
     let (_rate_limiter, client) = if let Some(limiter) = shared_rate_limiter {
-        let client =
-            build_rpc_client_with_limiter(&rpc_url, &chain.rpc, rpc_batch_size, limiter.clone())?;
+        let client = build_rpc_client_with_limiter(
+            &rpc_url,
+            &chain.rpc,
+            rpc_batch_size,
+            limiter.clone(),
+            use_alchemy,
+        )?;
         (limiter, Arc::new(client))
     } else {
-        build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+        build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size, use_alchemy)?
     };
 
     let s3_manifest = storage_manager.manifest_for(&chain.name);

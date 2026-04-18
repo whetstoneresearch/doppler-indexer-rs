@@ -18,7 +18,7 @@ use crate::transformations::{
     build_registry_for_chain, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage,
     ReorgMessage,
 };
-use crate::types::config::chain::{ChainConfig, RpcConfig};
+use crate::types::config::chain::{ChainConfig, ProviderType, RpcConfig};
 use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use crate::types::config::eth_call::Frequency;
 use crate::types::config::indexer::IndexerConfig;
@@ -129,6 +129,7 @@ pub fn build_rpc_client(
     rpc_url: &str,
     rpc_config: &RpcConfig,
     batch_size: usize,
+    use_alchemy: bool,
 ) -> anyhow::Result<(Arc<SlidingWindowRateLimiter>, Arc<UnifiedRpcClient>)> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
     let units_per_second = rpc_config
@@ -145,14 +146,16 @@ pub fn build_rpc_client(
         batch_size,
         Some(rate_limiter.clone()),
         http2,
+        use_alchemy,
     )?;
 
     tracing::info!(
-        "RPC config: concurrency={}, units_per_second={}, batch_size={}, http2={}",
+        "RPC config: concurrency={}, units_per_second={}, batch_size={}, http2={}, alchemy={}",
         concurrency,
         units_per_second,
         batch_size,
-        http2
+        http2,
+        use_alchemy,
     );
 
     Ok((rate_limiter, Arc::new(client)))
@@ -164,6 +167,7 @@ pub fn build_rpc_client_with_limiter(
     rpc_config: &RpcConfig,
     batch_size: usize,
     shared_limiter: Arc<SlidingWindowRateLimiter>,
+    use_alchemy: bool,
 ) -> anyhow::Result<UnifiedRpcClient> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
     let units_per_second = rpc_config
@@ -177,6 +181,7 @@ pub fn build_rpc_client_with_limiter(
         batch_size,
         Some(shared_limiter),
         rpc_config.http2_enabled(),
+        use_alchemy,
     )
     .map_err(Into::into)
 }
@@ -297,6 +302,9 @@ pub struct ChainRuntime {
     pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     pub transformations_enabled: bool,
     pub chain: Arc<ChainConfig>,
+    /// Whether the chain uses the Alchemy provider. Stored so `build_additional_client`
+    /// can create matching client instances without re-resolving config.
+    pub use_alchemy: bool,
 }
 
 impl ChainRuntime {
@@ -331,8 +339,27 @@ impl ChainRuntime {
             .or(config.raw_data_collection.rpc_batch_size)
             .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
 
-        // Resolve RPC parameters before building client
-        let concurrency = chain.rpc.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
+        // Resolve provider type and concurrency, with group config taking precedence.
+        let (concurrency, use_alchemy) =
+            if let Some(ref group_name) = chain.rpc.rate_limit_group {
+                let group = config
+                    .rpc_rate_limits
+                    .as_ref()
+                    .and_then(|groups| groups.get(group_name));
+                let group_concurrency = group
+                    .and_then(|g| g.concurrency)
+                    .unwrap_or(rpc_defaults::CONCURRENCY);
+                let provider = group
+                    .and_then(|g| g.provider.clone())
+                    .or_else(|| chain.rpc.provider.clone())
+                    .unwrap_or_default();
+                (group_concurrency, provider == ProviderType::Alchemy)
+            } else {
+                let concurrency = chain.rpc.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
+                let use_alchemy = chain.rpc.effective_provider() == ProviderType::Alchemy;
+                (concurrency, use_alchemy)
+            };
+
         let units_per_second = chain
             .rpc
             .units_per_second()
@@ -347,10 +374,11 @@ impl ChainRuntime {
                 rpc_batch_size,
                 Some(limiter.clone()),
                 chain.rpc.http2_enabled(),
+                use_alchemy,
             )?;
             (limiter, Arc::new(client))
         } else {
-            build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+            build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size, use_alchemy)?
         };
 
         // Build transformation registry filtered to this chain's contracts
@@ -439,6 +467,7 @@ impl ChainRuntime {
             progress_tracker,
             transformations_enabled,
             chain: Arc::new(chain.clone()),
+            use_alchemy,
         })
     }
 
@@ -449,6 +478,7 @@ impl ChainRuntime {
             &self.chain.rpc,
             self.rpc_batch_size,
             self.rate_limiter.clone(),
+            self.use_alchemy,
         )
     }
 

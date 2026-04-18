@@ -4,6 +4,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rand::Rng as _;
+
 use alloy::primitives::{Address, BlockNumber, Bytes, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{
@@ -147,10 +149,13 @@ impl SlidingWindowRateLimiter {
                     }
                 }
 
-                // Add a small buffer to ensure the entry has expired
+                // Add a small buffer plus jitter to prevent thundering-herd wakeups
+                // when many tasks wake simultaneously after the window resets.
+                let jitter_ms = rand::rng().random_range(0u64..50);
                 wait_until
                     .saturating_duration_since(now)
                     .saturating_add(Duration::from_millis(1))
+                    .saturating_add(Duration::from_millis(jitter_ms))
             };
 
             // Wait outside the lock
