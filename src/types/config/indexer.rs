@@ -82,6 +82,12 @@ impl IndexerConfig {
                     chain.name
                 );
             }
+            if chain.rpc.rate_limit_group.is_some() && chain.rpc.concurrency.is_some() {
+                anyhow::bail!(
+                    "Chain '{}' is in a rate_limit_group and must not set rpc.concurrency; set concurrency on the group instead",
+                    chain.name
+                );
+            }
         }
 
         Ok(IndexerConfig {
@@ -179,5 +185,66 @@ mod tests {
         fs::write(&path, config_json).unwrap();
         let result = IndexerConfig::load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_chain_in_group_with_concurrency_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let config_json = format!(
+            r#"{{
+                "chains": [
+                    {{
+                        "name": "test",
+                        "chain_id": 1,
+                        "rpc_url_env_var": "RPC_URL",
+                        "contracts": {{}},
+                        "rpc": {{
+                            "rate_limit_group": "shared",
+                            "concurrency": 50
+                        }}
+                    }}
+                ],
+                "rpc_rate_limits": {{
+                    "shared": {{ "units_per_second": 7500, "concurrency": 25 }}
+                }},
+                "raw_data_collection": {}
+            }}"#,
+            raw_data_collection_json()
+        );
+        let path = dir.path().join("config.json");
+        fs::write(&path, config_json).unwrap();
+        let result = IndexerConfig::load(&path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("must not set rpc.concurrency"));
+    }
+
+    #[test]
+    fn test_chain_in_group_with_group_provider_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let config_json = format!(
+            r#"{{
+                "chains": [
+                    {{
+                        "name": "test",
+                        "chain_id": 1,
+                        "rpc_url_env_var": "RPC_URL",
+                        "contracts": {{}},
+                        "rpc": {{
+                            "rate_limit_group": "shared"
+                        }}
+                    }}
+                ],
+                "rpc_rate_limits": {{
+                    "shared": {{ "units_per_second": 7500, "concurrency": 25, "provider": "alchemy" }}
+                }},
+                "raw_data_collection": {}
+            }}"#,
+            raw_data_collection_json()
+        );
+        let path = dir.path().join("config.json");
+        fs::write(&path, config_json).unwrap();
+        let result = IndexerConfig::load(&path);
+        assert!(result.is_ok());
     }
 }

@@ -50,6 +50,31 @@ impl UnifiedRpcClient {
         }
     }
 
+    /// Convenience wrapper that infers the provider from the URL string.
+    ///
+    /// Prefer `from_url_with_options` with an explicit `use_alchemy` flag derived
+    /// from the `provider` field in config.  This method is kept for contexts where
+    /// only a URL is available (e.g. tests, one-off tooling).
+    pub fn from_url_with_options_inferred(
+        url: &str,
+        compute_units_per_second: u32,
+        rpc_concurrency: usize,
+        max_batch_size: usize,
+        shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        force_http2: bool,
+    ) -> Result<Self, RpcError> {
+        let use_alchemy = url.contains("alchemy");
+        Self::from_url_with_options(
+            url,
+            compute_units_per_second,
+            rpc_concurrency,
+            max_batch_size,
+            shared_limiter,
+            force_http2,
+            use_alchemy,
+        )
+    }
+
     /// Create a client with custom options for Alchemy rate limiting.
     ///
     /// # Arguments
@@ -61,6 +86,10 @@ impl UnifiedRpcClient {
     /// * `force_http2` - When true, build the HTTP transport with HTTP/2 prior knowledge
     ///   (no HTTP/1.1 fallback) and H2 tuning (adaptive window, keep-alive). Applies to
     ///   both Standard and Alchemy clients.
+    /// * `use_alchemy` - When true, use `AlchemyClient` with per-method CU costs and a
+    ///   sliding-window rate limiter. When false, use the standard `RpcClient`.
+    ///   Caller should set this based on the explicit `provider` field in config rather
+    ///   than inferring from the URL.
     pub fn from_url_with_options(
         url: &str,
         compute_units_per_second: u32,
@@ -68,8 +97,9 @@ impl UnifiedRpcClient {
         max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
         force_http2: bool,
+        use_alchemy: bool,
     ) -> Result<Self, RpcError> {
-        if url.contains("alchemy") {
+        if use_alchemy {
             Ok(Self::Alchemy(AlchemyClient::from_url_with_options(
                 url,
                 compute_units_per_second,
@@ -371,13 +401,14 @@ mod tests {
             100,
             None,
             true,
+            false,
         )
         .expect("should build standard HTTP/2 client");
         assert!(matches!(client, UnifiedRpcClient::Standard(_)));
     }
 
-    /// Building an Alchemy client with force_http2=true should succeed and
-    /// select the Alchemy variant.
+    /// Building an Alchemy client via explicit use_alchemy=true should succeed and
+    /// select the Alchemy variant regardless of the URL string.
     #[test]
     fn from_url_with_options_alchemy_http2() {
         let client = UnifiedRpcClient::from_url_with_options(
@@ -387,8 +418,25 @@ mod tests {
             100,
             None,
             true,
+            true,
         )
         .expect("should build Alchemy HTTP/2 client");
+        assert!(matches!(client, UnifiedRpcClient::Alchemy(_)));
+    }
+
+    /// Explicit use_alchemy=true works with non-alchemy-domain URLs (proxy case).
+    #[test]
+    fn from_url_with_options_alchemy_proxied_url() {
+        let client = UnifiedRpcClient::from_url_with_options(
+            "https://my-proxy.example.com/rpc",
+            7500,
+            100,
+            100,
+            None,
+            false,
+            true,
+        )
+        .expect("should build Alchemy client via explicit provider flag");
         assert!(matches!(client, UnifiedRpcClient::Alchemy(_)));
     }
 
@@ -401,6 +449,7 @@ mod tests {
             100,
             100,
             None,
+            false,
             false,
         )
         .expect("should build standard client with default transport");

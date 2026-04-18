@@ -3,6 +3,19 @@ use std::path::Path;
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
+/// Selects the RPC provider implementation for a chain or rate limit group.
+///
+/// `Alchemy` enables the `AlchemyClient` with per-method compute-unit costs and a
+/// sliding-window rate limiter.  All other values (or the absence of the field)
+/// select the standard `RpcClient`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderType {
+    Alchemy,
+    #[default]
+    Standard,
+}
+
 use crate::types::config::contract::{
     load_contracts_from_path, load_factory_collections_from_path, Contracts, FactoryCollections,
 };
@@ -35,9 +48,17 @@ impl BlockReceiptsMethod {
 /// Configuration for a shared RPC rate limit group.
 ///
 /// Multiple chains can reference the same group to share a single rate limit budget.
+/// Concurrency set here supersedes per-chain `rpc.concurrency`; chains in this group
+/// must not set `rpc.concurrency`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcRateLimitGroup {
     pub units_per_second: u32,
+    /// Max concurrent in-flight RPC requests for all chains in this group combined.
+    /// Supersedes per-chain rpc.concurrency. Required when chains belong to this group.
+    pub concurrency: Option<usize>,
+    /// Provider implementation to use for all chains in this group.
+    /// Chains may not override this.
+    pub provider: Option<ProviderType>,
 }
 
 /// RPC client configuration for a chain.
@@ -70,6 +91,9 @@ pub struct RpcConfig {
     /// allows HTTP/1.1 fallback.
     #[serde(default)]
     pub http2: Option<bool>,
+    /// Provider implementation to use for this chain's RPC client.
+    /// When the chain belongs to a rate_limit_group, the group's provider takes precedence.
+    pub provider: Option<ProviderType>,
 }
 
 impl RpcConfig {
@@ -84,6 +108,13 @@ impl RpcConfig {
     /// Returns the resolved HTTP/2 opt-in flag. Defaults to false when unset.
     pub fn http2_enabled(&self) -> bool {
         self.http2.unwrap_or(false)
+    }
+
+    /// Returns the chain-level provider type. Defaults to `Standard` when unset.
+    /// When the chain belongs to a rate_limit_group, the group's provider takes precedence —
+    /// callers should resolve the effective provider via `IndexerConfig` before using this.
+    pub fn effective_provider(&self) -> ProviderType {
+        self.provider.clone().unwrap_or_default()
     }
 }
 
@@ -296,6 +327,7 @@ mod tests {
             batch_size: None,
             rate_limit_group: None,
             http2: None,
+            provider: None,
         };
 
         assert_eq!(rpc.units_per_second(), Some(25));
