@@ -19,7 +19,9 @@ use crate::transformations::event::metrics::v4_hook_extract::{
     extract_tuple_modify_liquidity, extract_v4_hook_swaps, extract_v4_hook_tvl_targets,
 };
 use crate::transformations::registry::TransformationRegistry;
-use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+use crate::transformations::traits::{
+    dep, EventHandler, EventTrigger, HandlerDependencySpec, TransformationHandler,
+};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::usd_price::{
     build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
@@ -131,8 +133,8 @@ impl EventHandler for DecayMulticurveSwapMetricsHandler {
         ]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["V4DecayMulticurveCreateHandler"]
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        vec![dep("V4DecayMulticurveCreateHandler").only([8453, 84532, 11155111])]
     }
 }
 
@@ -177,8 +179,8 @@ impl EventHandler for DecayMulticurveLiquidityMetricsHandler {
         )]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["V4DecayMulticurveCreateHandler"]
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        vec![dep("V4DecayMulticurveCreateHandler").only([8453, 84532, 11155111])]
     }
 }
 
@@ -288,10 +290,10 @@ impl EventHandler for DecayMulticurveTvlMetricsHandler {
         ]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
         vec![
-            "V4DecayMulticurveCreateHandler",
-            "DecayMulticurveLiquidityMetricsHandler",
+            dep("V4DecayMulticurveCreateHandler").only([8453, 84532, 11155111]),
+            dep("DecayMulticurveLiquidityMetricsHandler").only([8453, 84532, 11155111]),
         ]
     }
 }
