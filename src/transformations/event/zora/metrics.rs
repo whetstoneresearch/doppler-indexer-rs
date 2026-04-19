@@ -291,7 +291,11 @@ impl EventHandler for ZoraTvlMetricsHandler {
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["ZoraCreateHandler", "ZoraSwapMetricsHandler"]
+        vec![
+            "ZoraCreateHandler",
+            "ZoraMigrateHandler",
+            "ZoraSwapMetricsHandler",
+        ]
     }
 }
 
