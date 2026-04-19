@@ -113,6 +113,21 @@ pub enum SolanaCommitment {
     Finalized,
 }
 
+/// Provider strategy for Solana historical transaction discovery.
+///
+/// `Auto` uses Helius' archival `getTransactionsForAddress` when the configured
+/// RPC URL appears to point at Helius, and falls back to standard
+/// `getSignaturesForAddress` on unsupported-provider or transient transport
+/// failures. `Helius` and `Standard` force one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SolanaHistoricalProvider {
+    #[default]
+    Auto,
+    Helius,
+    Standard,
+}
+
 /// Load Solana programs from a path (file or directory). Mirrors
 /// `load_contracts_from_path` in `contract.rs` and inherits HashMap-based
 /// merging plus duplicate-key detection from `loader::MergeableConfig`.
@@ -151,6 +166,28 @@ mod tests {
     fn solana_commitment_rejects_unknown_value() {
         let result: Result<SolanaCommitment, _> = serde_json::from_str(r#""safe""#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn solana_historical_provider_default_is_auto() {
+        assert_eq!(
+            SolanaHistoricalProvider::default(),
+            SolanaHistoricalProvider::Auto
+        );
+    }
+
+    #[test]
+    fn solana_historical_provider_serde_roundtrip() {
+        for (json, variant) in [
+            (r#""auto""#, SolanaHistoricalProvider::Auto),
+            (r#""helius""#, SolanaHistoricalProvider::Helius),
+            (r#""standard""#, SolanaHistoricalProvider::Standard),
+        ] {
+            let parsed: SolanaHistoricalProvider = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed, variant);
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, json);
+        }
     }
 
     #[test]

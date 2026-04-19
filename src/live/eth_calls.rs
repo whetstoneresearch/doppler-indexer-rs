@@ -846,6 +846,8 @@ mod tests {
             solana_programs: Default::default(),
             #[cfg(feature = "solana")]
             commitment: Default::default(),
+            #[cfg(feature = "solana")]
+            historical_provider: Default::default(),
         }
     }
 

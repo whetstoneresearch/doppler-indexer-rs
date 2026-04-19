@@ -26,7 +26,7 @@ use crate::storage::paths::{
     raw_solana_events_dir, raw_solana_instructions_dir, raw_solana_slots_dir, BlockRange,
 };
 use crate::storage::skipped_slots;
-use crate::types::config::solana::SolanaPrograms;
+use crate::types::config::solana::{SolanaHistoricalProvider, SolanaPrograms};
 use crate::types::shared::repair::RepairScope;
 
 use super::slots::collect_slots_selective;
@@ -51,6 +51,7 @@ const SIGNATURES_PAGE_SIZE: usize = 1000;
 pub async fn signature_driven_backfill(
     chain_name: &str,
     rpc_client: &SolanaRpcClient,
+    historical_provider: SolanaHistoricalProvider,
     programs: &SolanaPrograms,
     range_size: u64,
     configured_programs: &HashSet<[u8; 32]>,
@@ -142,8 +143,14 @@ pub async fn signature_driven_backfill(
     };
 
     // Collect all signatures for active programs, grouped by slot
-    let slots_with_sigs =
-        collect_all_signatures(rpc_client, active_programs, effective_start, end_slot).await?;
+    let slots_with_sigs = collect_all_signatures(
+        rpc_client,
+        historical_provider,
+        active_programs,
+        effective_start,
+        end_slot,
+    )
+    .await?;
 
     if slots_with_sigs.is_empty() && !is_repair {
         tracing::info!(
@@ -305,6 +312,7 @@ pub async fn signature_driven_backfill(
 /// signatures are merged.
 async fn collect_all_signatures(
     rpc_client: &SolanaRpcClient,
+    historical_provider: SolanaHistoricalProvider,
     programs: &SolanaPrograms,
     start_slot: u64,
     end_slot: Option<u64>,
@@ -329,84 +337,248 @@ async fn collect_all_signatures(
             "Collecting signatures for program"
         );
 
-        let mut before: Option<Signature> = None;
-        let mut page_count = 0u64;
-
-        loop {
-            let sigs = rpc_client
-                .get_signatures_for_address(&pubkey, before, Some(SIGNATURES_PAGE_SIZE))
-                .await?;
-
-            if sigs.is_empty() {
-                break;
+        let backend = select_signature_backend(historical_provider, rpc_client);
+        let collected = match backend {
+            HistoricalSignatureBackend::Standard => {
+                collect_program_signatures_standard(
+                    rpc_client,
+                    program_name,
+                    &pubkey,
+                    effective_start,
+                    end_slot,
+                )
+                .await?
             }
-
-            page_count += 1;
-            let page_len = sigs.len();
-            let mut reached_start = false;
-
-            for sig_info in &sigs {
-                // Stop if we've gone past our start slot
-                if sig_info.slot < effective_start {
-                    reached_start = true;
-                    break;
-                }
-
-                // Skip slots above the end bound (repair scoping)
-                if let Some(end) = end_slot {
-                    if sig_info.slot > end {
-                        continue;
+            HistoricalSignatureBackend::Helius => {
+                match collect_program_signatures_helius(
+                    rpc_client,
+                    program_name,
+                    &pubkey,
+                    effective_start,
+                    end_slot,
+                )
+                .await
+                {
+                    Ok(collected) => collected,
+                    Err(err)
+                        if historical_provider == SolanaHistoricalProvider::Auto
+                            && should_auto_fallback_to_standard(&err) =>
+                    {
+                        tracing::warn!(
+                            program = program_name.as_str(),
+                            error = %err,
+                            "Helius historical scan failed, falling back to getSignaturesForAddress",
+                        );
+                        collect_program_signatures_standard(
+                            rpc_client,
+                            program_name,
+                            &pubkey,
+                            effective_start,
+                            end_slot,
+                        )
+                        .await?
                     }
-                }
-
-                // Parse the signature string
-                if let Ok(sig) = sig_info.signature.parse::<Signature>() {
-                    let mut sig_bytes = [0u8; 64];
-                    sig_bytes.copy_from_slice(sig.as_ref());
-                    all_slots.entry(sig_info.slot).or_default().push(sig_bytes);
+                    Err(err) => return Err(err),
                 }
             }
+        };
 
-            if reached_start {
-                tracing::debug!(
-                    program = program_name.as_str(),
-                    pages = page_count,
-                    "Reached start slot, stopping pagination"
-                );
-                break;
-            }
-
-            // Set up pagination cursor: use the last signature as `before`
-            if page_len < SIGNATURES_PAGE_SIZE {
-                // Less than a full page means we've reached the end
-                break;
-            }
-
-            // Parse the last signature for pagination
-            if let Some(last_sig) = sigs.last() {
-                if let Ok(sig) = last_sig.signature.parse::<Signature>() {
-                    before = Some(sig);
-                } else {
-                    tracing::warn!(
-                        program = program_name.as_str(),
-                        signature = last_sig.signature.as_str(),
-                        "Failed to parse pagination signature"
-                    );
-                    break;
-                }
-            }
+        let mut program_slots = BTreeSet::new();
+        for (slot, sig_bytes) in collected.signatures {
+            program_slots.insert(slot);
+            all_slots.entry(slot).or_default().push(sig_bytes);
         }
 
-        let slots_found = all_slots.len();
         tracing::info!(
             program = program_name.as_str(),
-            pages = page_count,
-            total_slots = slots_found,
+            backend = ?backend,
+            pages = collected.pages,
+            total_slots = program_slots.len(),
             "Finished collecting signatures for program"
         );
     }
 
     Ok(all_slots)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalSignatureBackend {
+    Standard,
+    Helius,
+}
+
+#[derive(Debug, Default)]
+struct ProgramSignatureCollection {
+    pages: u64,
+    signatures: Vec<(u64, [u8; 64])>,
+}
+
+fn select_signature_backend(
+    provider: SolanaHistoricalProvider,
+    rpc_client: &SolanaRpcClient,
+) -> HistoricalSignatureBackend {
+    match provider {
+        SolanaHistoricalProvider::Standard => HistoricalSignatureBackend::Standard,
+        SolanaHistoricalProvider::Helius => HistoricalSignatureBackend::Helius,
+        SolanaHistoricalProvider::Auto => {
+            if rpc_client.is_helius_endpoint() {
+                HistoricalSignatureBackend::Helius
+            } else {
+                HistoricalSignatureBackend::Standard
+            }
+        }
+    }
+}
+
+fn should_auto_fallback_to_standard(err: &SolanaRpcError) -> bool {
+    if err.is_retryable() {
+        return true;
+    }
+
+    let msg = err.to_string().to_lowercase();
+    msg.contains("method not found")
+        || msg.contains("unsupported")
+        || msg.contains("developer plan")
+        || msg.contains("forbidden")
+        || msg.contains("unauthorized")
+        || msg.contains("429")
+        || msg.contains("too many requests")
+        || msg.contains("rate limit")
+        || msg.contains("rate-limit")
+        || msg.contains("throttle")
+        || msg.contains("quota exceeded")
+        || msg.contains("quota limit")
+        || msg.contains("credit limit")
+        || msg.contains("credits exhausted")
+        || msg.contains("not part of standard solana rpc")
+}
+
+async fn collect_program_signatures_standard(
+    rpc_client: &SolanaRpcClient,
+    program_name: &str,
+    pubkey: &Pubkey,
+    start_slot: u64,
+    end_slot: Option<u64>,
+) -> Result<ProgramSignatureCollection, SolanaRpcError> {
+    let mut before: Option<Signature> = None;
+    let mut page_count = 0u64;
+    let mut collected = ProgramSignatureCollection::default();
+
+    loop {
+        let sigs = rpc_client
+            .get_signatures_for_address(pubkey, before, Some(SIGNATURES_PAGE_SIZE))
+            .await?;
+
+        if sigs.is_empty() {
+            break;
+        }
+
+        page_count += 1;
+        let page_len = sigs.len();
+        let mut reached_start = false;
+
+        for sig_info in &sigs {
+            if sig_info.slot < start_slot {
+                reached_start = true;
+                break;
+            }
+
+            if let Some(end) = end_slot {
+                if sig_info.slot > end {
+                    continue;
+                }
+            }
+
+            if let Ok(sig) = sig_info.signature.parse::<Signature>() {
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes.copy_from_slice(sig.as_ref());
+                collected.signatures.push((sig_info.slot, sig_bytes));
+            }
+        }
+
+        if reached_start {
+            tracing::debug!(
+                program = program_name,
+                pages = page_count,
+                "Reached start slot, stopping pagination"
+            );
+            break;
+        }
+
+        if page_len < SIGNATURES_PAGE_SIZE {
+            break;
+        }
+
+        if let Some(last_sig) = sigs.last() {
+            if let Ok(sig) = last_sig.signature.parse::<Signature>() {
+                before = Some(sig);
+            } else {
+                tracing::warn!(
+                    program = program_name,
+                    signature = last_sig.signature.as_str(),
+                    "Failed to parse pagination signature"
+                );
+                break;
+            }
+        }
+    }
+
+    collected.pages = page_count;
+    Ok(collected)
+}
+
+async fn collect_program_signatures_helius(
+    rpc_client: &SolanaRpcClient,
+    program_name: &str,
+    pubkey: &Pubkey,
+    start_slot: u64,
+    end_slot: Option<u64>,
+) -> Result<ProgramSignatureCollection, SolanaRpcError> {
+    let mut pagination_token: Option<String> = None;
+    let mut page_count = 0u64;
+    let mut collected = ProgramSignatureCollection::default();
+
+    loop {
+        let page = rpc_client
+            .get_transactions_for_address_helius(
+                pubkey,
+                pagination_token.as_deref(),
+                start_slot,
+                end_slot,
+                SIGNATURES_PAGE_SIZE,
+            )
+            .await?;
+
+        if page.data.is_empty() {
+            break;
+        }
+
+        page_count += 1;
+        let next_token = page.pagination_token.clone();
+
+        for sig_info in page.data {
+            if let Ok(sig) = sig_info.signature.parse::<Signature>() {
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes.copy_from_slice(sig.as_ref());
+                collected.signatures.push((sig_info.slot, sig_bytes));
+            } else {
+                tracing::warn!(
+                    program = program_name,
+                    signature = sig_info.signature,
+                    "Failed to parse Helius pagination signature"
+                );
+            }
+        }
+
+        if next_token.is_none() {
+            break;
+        }
+
+        pagination_token = next_token;
+    }
+
+    collected.pages = page_count;
+    Ok(collected)
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +653,7 @@ pub fn find_resume_slot(chain_name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::config::solana::SolanaHistoricalProvider;
 
     #[test]
     fn test_group_slots_into_ranges_basic() {
@@ -566,5 +739,60 @@ mod tests {
         // With a non-existent chain name, should return None
         let result = find_resume_slot("nonexistent_chain_xyz_123");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_signature_backend_prefers_helius_only_for_helius_urls_in_auto() {
+        let helius_client = SolanaRpcClient::new(
+            "https://mainnet.helius-rpc.com/?api-key=test",
+            crate::types::config::solana::SolanaCommitment::Confirmed,
+            Some(10),
+            Some(1),
+        )
+        .unwrap();
+        let standard_client = SolanaRpcClient::new(
+            "https://api.mainnet-beta.solana.com",
+            crate::types::config::solana::SolanaCommitment::Confirmed,
+            Some(10),
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_signature_backend(SolanaHistoricalProvider::Auto, &helius_client),
+            HistoricalSignatureBackend::Helius
+        );
+        assert_eq!(
+            select_signature_backend(SolanaHistoricalProvider::Auto, &standard_client),
+            HistoricalSignatureBackend::Standard
+        );
+        assert_eq!(
+            select_signature_backend(SolanaHistoricalProvider::Helius, &standard_client),
+            HistoricalSignatureBackend::Helius
+        );
+    }
+
+    #[test]
+    fn auto_fallback_classifies_provider_plan_and_throttle_errors() {
+        assert!(should_auto_fallback_to_standard(
+            &SolanaRpcError::Transport(
+                "Helius getTransactionsForAddress error -32601: Method not found".to_string(),
+            )
+        ));
+        assert!(should_auto_fallback_to_standard(
+            &SolanaRpcError::Transport(
+                "Helius getTransactionsForAddress HTTP 403 Forbidden: requires Developer plan"
+                    .to_string(),
+            )
+        ));
+        assert!(should_auto_fallback_to_standard(
+            &SolanaRpcError::RateLimitExceeded
+        ));
+        assert!(should_auto_fallback_to_standard(&SolanaRpcError::Provider(
+            "Helius quota exceeded for current plan".to_string(),
+        )));
+        assert!(!should_auto_fallback_to_standard(
+            &SolanaRpcError::InvalidPubkey("bad".to_string(),)
+        ));
     }
 }

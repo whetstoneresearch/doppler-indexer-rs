@@ -474,6 +474,7 @@ pub async fn process_solana_chain(
         let chain_name = runtime.chain.name.clone();
         let rpc_client = runtime.rpc_client.clone();
         let programs = runtime.chain.solana_programs.clone();
+        let historical_provider = runtime.chain.historical_provider;
         let configured_programs = runtime.configured_programs.clone();
         let event_tx = event_decoder_tx.clone();
         let instr_tx = instr_decoder_tx.clone();
@@ -483,6 +484,7 @@ pub async fn process_solana_chain(
             let result = signature_driven_backfill(
                 &chain_name,
                 &rpc_client,
+                historical_provider,
                 &programs,
                 range_size,
                 &configured_programs,
@@ -2791,7 +2793,7 @@ mod tests {
         use crate::types::chain::ChainType;
         use crate::types::config::chain::RpcConfig;
         use crate::types::config::contract::{Contracts, FactoryCollections};
-        use crate::types::config::solana::SolanaCommitment;
+        use crate::types::config::solana::{SolanaCommitment, SolanaHistoricalProvider};
 
         ChainConfig {
             name: "test-solana".to_string(),
@@ -2808,6 +2810,7 @@ mod tests {
             rpc: RpcConfig::default(),
             solana_programs: programs,
             commitment: SolanaCommitment::default(),
+            historical_provider: SolanaHistoricalProvider::default(),
         }
     }
 

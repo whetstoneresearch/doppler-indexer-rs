@@ -2,6 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Client as HttpClient;
+use serde::{Deserialize, Serialize};
 use solana_client::client_error::ClientError as SolanaClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClientInner;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
@@ -33,6 +35,9 @@ pub enum SolanaRpcError {
     #[error("Solana RPC transport error: {0}")]
     Transport(String),
 
+    #[error("Solana RPC provider error: {0}")]
+    Provider(String),
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
@@ -59,6 +64,7 @@ impl SolanaRpcError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(_) => true,
+            Self::Provider(_) => false,
             Self::RateLimitExceeded => true,
             Self::BlockNotAvailable(_, _) => true,
             Self::SlotSkipped(_) => false,
@@ -154,16 +160,131 @@ pub fn commitment_config_from(c: SolanaCommitment) -> CommitmentConfig {
     }
 }
 
+fn commitment_str_for_helius(c: SolanaCommitment) -> &'static str {
+    match c {
+        // Helius archival getTransactionsForAddress supports confirmed/finalized.
+        // Historical catchup does not benefit from `processed`, so treat it as
+        // confirmed when the chain config requests it.
+        SolanaCommitment::Processed => "confirmed",
+        SolanaCommitment::Confirmed => "confirmed",
+        SolanaCommitment::Finalized => "finalized",
+    }
+}
+
+fn build_http_client() -> Result<HttpClient, SolanaRpcError> {
+    HttpClient::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| SolanaRpcError::Transport(format!("failed to build HTTP client: {e}")))
+}
+
+fn helius_message_indicates_rate_limit(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.contains("429")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
+        || message.contains("rate-limit")
+        || message.contains("throttle")
+        || message.contains("quota exceeded")
+        || message.contains("quota limit")
+        || message.contains("credit limit")
+        || message.contains("credits exhausted")
+}
+
+fn classify_helius_http_error(status: reqwest::StatusCode, body: &str) -> SolanaRpcError {
+    let error = format!("Helius getTransactionsForAddress HTTP {}: {}", status, body);
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || helius_message_indicates_rate_limit(body)
+    {
+        SolanaRpcError::RateLimitExceeded
+    } else if status.is_server_error() {
+        SolanaRpcError::Transport(error)
+    } else {
+        SolanaRpcError::Provider(error)
+    }
+}
+
+fn classify_helius_rpc_error(code: i64, message: &str) -> SolanaRpcError {
+    if code == 429 || helius_message_indicates_rate_limit(message) {
+        SolanaRpcError::RateLimitExceeded
+    } else {
+        SolanaRpcError::Provider(format!(
+            "Helius getTransactionsForAddress error {}: {}",
+            code, message
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HeliusSignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HeliusTransactionsPage {
+    pub data: Vec<HeliusSignatureInfo>,
+    #[serde(rename = "paginationToken")]
+    pub pagination_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcRequest<T> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse<T> {
+    result: Option<T>,
+    error: Option<JsonRpcErrorBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcErrorBody {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HeliusTransactionsParams<'a> {
+    #[serde(rename = "transactionDetails")]
+    transaction_details: &'static str,
+    #[serde(rename = "sortOrder")]
+    sort_order: &'static str,
+    limit: usize,
+    commitment: &'a str,
+    filters: HeliusTransactionsFilters,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "paginationToken")]
+    pagination_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct HeliusTransactionsFilters {
+    slot: HeliusSlotFilter,
+}
+
+#[derive(Debug, Serialize)]
+struct HeliusSlotFilter {
+    gte: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lte: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
 pub struct SolanaRpcClient {
     inner: Arc<SolanaRpcClientInner>,
+    rpc_url: String,
+    http_client: HttpClient,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
     semaphore: Arc<Semaphore>,
     retry_config: RetryConfig,
     commitment: CommitmentConfig,
+    commitment_level: SolanaCommitment,
     batch_concurrency: usize,
 }
 
@@ -185,10 +306,13 @@ impl SolanaRpcClient {
 
         Ok(Self {
             inner: Arc::new(inner),
+            rpc_url: rpc_url.to_string(),
+            http_client: build_http_client()?,
             rate_limiter: Arc::new(SlidingWindowRateLimiter::new(rps)),
             semaphore: Arc::new(Semaphore::new(conc)),
             retry_config: RetryConfig::default(),
             commitment: commitment_config,
+            commitment_level: commitment,
             batch_concurrency: defaults::BATCH_CONCURRENCY,
         })
     }
@@ -209,10 +333,13 @@ impl SolanaRpcClient {
 
         Ok(Self {
             inner: Arc::new(inner),
+            rpc_url: rpc_url.to_string(),
+            http_client: build_http_client()?,
             rate_limiter: shared_limiter,
             semaphore: Arc::new(Semaphore::new(conc)),
             retry_config: RetryConfig::default(),
             commitment: commitment_config,
+            commitment_level: commitment,
             batch_concurrency: defaults::BATCH_CONCURRENCY,
         })
     }
@@ -397,6 +524,102 @@ impl SolanaRpcClient {
         .await
     }
 
+    /// Returns true when the configured RPC URL appears to point at Helius.
+    pub fn is_helius_endpoint(&self) -> bool {
+        url::Url::parse(&self.rpc_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .map(|host| host.to_ascii_lowercase().contains("helius"))
+            .unwrap_or(false)
+    }
+
+    /// Helius-exclusive archival transaction scan with slot filtering and
+    /// pagination. Returns signature metadata only.
+    pub async fn get_transactions_for_address_helius(
+        &self,
+        address: &Pubkey,
+        pagination_token: Option<&str>,
+        start_slot: u64,
+        end_slot: Option<u64>,
+        limit: usize,
+    ) -> Result<HeliusTransactionsPage, SolanaRpcError> {
+        let rpc_url = self.rpc_url.clone();
+        let http_client = self.http_client.clone();
+        let address = address.to_string();
+        let commitment = commitment_str_for_helius(self.commitment_level);
+        let pagination_token = pagination_token.map(ToOwned::to_owned);
+
+        self.execute("helius_getTransactionsForAddress", || {
+            let rpc_url = rpc_url.clone();
+            let http_client = http_client.clone();
+            let address = address.clone();
+            let pagination_token = pagination_token.clone();
+            async move {
+                let request = JsonRpcRequest {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "getTransactionsForAddress",
+                    params: (
+                        address,
+                        HeliusTransactionsParams {
+                            transaction_details: "signatures",
+                            sort_order: "desc",
+                            limit,
+                            commitment,
+                            filters: HeliusTransactionsFilters {
+                                slot: HeliusSlotFilter {
+                                    gte: start_slot,
+                                    lte: end_slot,
+                                },
+                            },
+                            pagination_token: pagination_token.as_deref(),
+                        },
+                    ),
+                };
+
+                let response = http_client
+                    .post(&rpc_url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        SolanaRpcError::Transport(format!(
+                            "Helius getTransactionsForAddress request failed: {e}"
+                        ))
+                    })?;
+
+                let status = response.status();
+                let body = response.text().await.map_err(|e| {
+                    SolanaRpcError::Transport(format!(
+                        "Helius getTransactionsForAddress response read failed: {e}"
+                    ))
+                })?;
+
+                if !status.is_success() {
+                    return Err(classify_helius_http_error(status, &body));
+                }
+
+                let rpc_response: JsonRpcResponse<HeliusTransactionsPage> =
+                    serde_json::from_str(&body).map_err(|e| {
+                        SolanaRpcError::SerializationError(format!(
+                            "failed to decode Helius getTransactionsForAddress response: {e}"
+                        ))
+                    })?;
+
+                if let Some(error) = rpc_response.error {
+                    return Err(classify_helius_rpc_error(error.code, &error.message));
+                }
+
+                rpc_response.result.ok_or_else(|| {
+                    SolanaRpcError::SerializationError(
+                        "Helius getTransactionsForAddress missing result".to_string(),
+                    )
+                })
+            }
+        })
+        .await
+    }
+
     /// Get transaction signatures for an address, with optional pagination.
     ///
     /// Used for historical backfill.
@@ -554,6 +777,22 @@ mod tests {
 
         let finalized = commitment_config_from(SolanaCommitment::Finalized);
         assert_eq!(finalized, CommitmentConfig::finalized());
+    }
+
+    #[test]
+    fn test_helius_rate_limit_classification() {
+        assert!(matches!(
+            classify_helius_http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "Too many requests"),
+            SolanaRpcError::RateLimitExceeded
+        ));
+        assert!(matches!(
+            classify_helius_rpc_error(-32000, "quota exceeded for current plan"),
+            SolanaRpcError::RateLimitExceeded
+        ));
+        assert!(matches!(
+            classify_helius_http_error(reqwest::StatusCode::FORBIDDEN, "requires Developer plan"),
+            SolanaRpcError::Provider(_)
+        ));
     }
 
     #[test]

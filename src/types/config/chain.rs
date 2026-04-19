@@ -10,7 +10,7 @@ use crate::types::config::contract::{
 use crate::types::config::generic::InlineOrPath;
 #[cfg(feature = "solana")]
 use crate::types::config::solana::{
-    load_solana_programs_from_path, SolanaCommitment, SolanaPrograms,
+    load_solana_programs_from_path, SolanaCommitment, SolanaHistoricalProvider, SolanaPrograms,
 };
 
 /// RPC method to use for fetching block receipts.
@@ -126,6 +126,11 @@ pub struct ChainConfigRaw {
     #[cfg(feature = "solana")]
     #[serde(default)]
     pub commitment: Option<SolanaCommitment>,
+    /// Strategy for Solana historical transaction discovery.
+    /// Defaults to `auto` when absent.
+    #[cfg(feature = "solana")]
+    #[serde(default)]
+    pub historical_provider: Option<SolanaHistoricalProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,9 @@ pub struct ChainConfig {
     /// Resolved Solana commitment level. Defaults to `Confirmed`.
     #[cfg(feature = "solana")]
     pub commitment: SolanaCommitment,
+    /// Historical discovery provider strategy. Defaults to `Auto`.
+    #[cfg(feature = "solana")]
+    pub historical_provider: SolanaHistoricalProvider,
 }
 
 impl ChainConfig {
@@ -246,6 +254,9 @@ pub fn resolve_chain_config(
     #[cfg(feature = "solana")]
     let commitment = raw_config.commitment.unwrap_or_default();
 
+    #[cfg(feature = "solana")]
+    let historical_provider = raw_config.historical_provider.unwrap_or_default();
+
     Ok(ChainConfig {
         name: raw_config.name,
         chain_id: raw_config.chain_id,
@@ -263,6 +274,8 @@ pub fn resolve_chain_config(
         solana_programs,
         #[cfg(feature = "solana")]
         commitment,
+        #[cfg(feature = "solana")]
+        historical_provider,
     })
 }
 
@@ -324,6 +337,8 @@ mod tests {
             programs: None,
             #[cfg(feature = "solana")]
             commitment: None,
+            #[cfg(feature = "solana")]
+            historical_provider: None,
         };
         let result = resolve_chain_config(raw, Path::new("/tmp"));
         assert!(result.is_err());
@@ -348,6 +363,8 @@ mod tests {
             programs: None,
             #[cfg(feature = "solana")]
             commitment: None,
+            #[cfg(feature = "solana")]
+            historical_provider: None,
         };
         let result = resolve_chain_config(raw, Path::new("/tmp"));
         assert!(result.is_ok());
@@ -429,7 +446,7 @@ mod tests {
     #[cfg(feature = "solana")]
     mod solana_tests {
         use super::*;
-        use crate::types::config::solana::SolanaCommitment;
+        use crate::types::config::solana::{SolanaCommitment, SolanaHistoricalProvider};
 
         #[test]
         fn chain_config_raw_solana_with_inline_programs_deserializes() {
@@ -451,6 +468,7 @@ mod tests {
             let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
             assert_eq!(raw.chain_type, ChainType::Solana);
             assert_eq!(raw.commitment, Some(SolanaCommitment::Finalized));
+            assert_eq!(raw.historical_provider, None);
             let programs = raw.programs.expect("programs present");
             match programs {
                 InlineOrPath::Inline(map) => {
@@ -473,6 +491,7 @@ mod tests {
             let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
             assert!(raw.programs.is_none());
             assert!(raw.commitment.is_none());
+            assert!(raw.historical_provider.is_none());
         }
 
         #[test]
@@ -495,6 +514,7 @@ mod tests {
             let resolved = resolve_chain_config(raw, Path::new("/tmp")).unwrap();
             assert_eq!(resolved.chain_type, ChainType::Solana);
             assert_eq!(resolved.commitment, SolanaCommitment::Processed);
+            assert_eq!(resolved.historical_provider, SolanaHistoricalProvider::Auto);
             assert_eq!(resolved.solana_programs.len(), 1);
             let program = resolved
                 .solana_programs
@@ -523,6 +543,7 @@ mod tests {
                 rpc: RpcConfig::default(),
                 programs: Some(InlineOrPath::Path("nonexistent/programs.json".to_string())),
                 commitment: None,
+                historical_provider: None,
             };
             let result = resolve_chain_config(raw, Path::new("/tmp"));
             assert!(result.is_err());
@@ -547,10 +568,36 @@ mod tests {
                 rpc: RpcConfig::default(),
                 programs: None,
                 commitment: None,
+                historical_provider: None,
             };
             let resolved = resolve_chain_config(raw, Path::new("/tmp")).unwrap();
             assert_eq!(resolved.commitment, SolanaCommitment::Confirmed);
+            assert_eq!(resolved.historical_provider, SolanaHistoricalProvider::Auto);
             assert!(resolved.solana_programs.is_empty());
+        }
+
+        #[test]
+        fn resolve_chain_config_solana_historical_provider_deserializes() {
+            let json = r#"{
+                "name": "solana",
+                "chain_id": 101,
+                "chain_type": "solana",
+                "rpc_url_env_var": "SOLANA_RPC_URL",
+                "contracts": {},
+                "historical_provider": "helius"
+            }"#;
+
+            let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                raw.historical_provider,
+                Some(SolanaHistoricalProvider::Helius)
+            );
+
+            let resolved = resolve_chain_config(raw, Path::new("/tmp")).unwrap();
+            assert_eq!(
+                resolved.historical_provider,
+                SolanaHistoricalProvider::Helius
+            );
         }
     }
 
@@ -603,6 +650,8 @@ mod tests {
             solana_programs: Default::default(),
             #[cfg(feature = "solana")]
             commitment: Default::default(),
+            #[cfg(feature = "solana")]
+            historical_provider: Default::default(),
         }
     }
 
