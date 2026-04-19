@@ -281,6 +281,11 @@ fn status_dir(chain_name: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/live/status", chain_name))
 }
 
+/// Return the highest block `N` such that every status file present between
+/// the lowest present block and `N` has `transformed=true`. Stops at the first
+/// gap in numbering or the first non-transformed block. This is the highest
+/// block for which all prior live transformations are known to have applied to
+/// `pool_state`, which is the invariant a leaderboard snapshot relies on.
 fn latest_transformed_from_status_dir(status_dir: &Path) -> Result<Option<u64>, SnapshotError> {
     let entries = match fs::read_dir(status_dir) {
         Ok(entries) => entries,
@@ -288,7 +293,7 @@ fn latest_transformed_from_status_dir(status_dir: &Path) -> Result<Option<u64>, 
         Err(e) => return Err(e.into()),
     };
 
-    let mut latest = None;
+    let mut statuses: Vec<(u64, bool)> = Vec::new();
     for entry in entries {
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -305,12 +310,27 @@ fn latest_transformed_from_status_dir(status_dir: &Path) -> Result<Option<u64>, 
 
         let file = fs::File::open(&path)?;
         let status: StatusSummary = serde_json::from_reader(BufReader::new(file))?;
-        if status.transformed {
-            latest = Some(latest.map_or(number, |prev: u64| prev.max(number)));
-        }
+        statuses.push((number, status.transformed));
     }
 
-    Ok(latest)
+    statuses.sort_by_key(|(n, _)| *n);
+
+    let mut head: Option<u64> = None;
+    let mut prev: Option<u64> = None;
+    for (number, transformed) in statuses {
+        if let Some(p) = prev {
+            if number != p + 1 {
+                break;
+            }
+        }
+        if !transformed {
+            break;
+        }
+        head = Some(number);
+        prev = Some(number);
+    }
+
+    Ok(head)
 }
 
 fn ready_snapshot_head(pool_state_head: Option<u64>, transformed_head: Option<u64>) -> Option<u64> {
@@ -389,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_transformed_from_status_dir_picks_highest_transformed_file() {
+    fn latest_transformed_from_status_dir_stops_at_non_transformed_gap() {
         let tmp = TempDir::new().unwrap();
         let status_dir = tmp.path().join("status");
         fs::create_dir_all(&status_dir).unwrap();
@@ -412,6 +432,71 @@ mod tests {
         fs::write(status_dir.join("ignore.tmp"), b"junk").unwrap();
 
         let latest = latest_transformed_from_status_dir(&status_dir).unwrap();
-        assert_eq!(latest, Some(102));
+        assert_eq!(latest, Some(100));
+    }
+
+    #[test]
+    fn latest_transformed_from_status_dir_stops_at_missing_block() {
+        let tmp = TempDir::new().unwrap();
+        let status_dir = tmp.path().join("status");
+        fs::create_dir_all(&status_dir).unwrap();
+
+        fs::write(
+            status_dir.join("100.json"),
+            r#"{"transformed":true,"completed_handlers":["a"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            status_dir.join("101.json"),
+            r#"{"transformed":true,"completed_handlers":["a"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            status_dir.join("103.json"),
+            r#"{"transformed":true,"completed_handlers":["a"]}"#,
+        )
+        .unwrap();
+
+        let latest = latest_transformed_from_status_dir(&status_dir).unwrap();
+        assert_eq!(latest, Some(101));
+    }
+
+    #[test]
+    fn latest_transformed_from_status_dir_advances_through_contiguous_transformed() {
+        let tmp = TempDir::new().unwrap();
+        let status_dir = tmp.path().join("status");
+        fs::create_dir_all(&status_dir).unwrap();
+
+        for n in 100..=103 {
+            fs::write(
+                status_dir.join(format!("{n}.json")),
+                r#"{"transformed":true,"completed_handlers":["a"]}"#,
+            )
+            .unwrap();
+        }
+
+        let latest = latest_transformed_from_status_dir(&status_dir).unwrap();
+        assert_eq!(latest, Some(103));
+    }
+
+    #[test]
+    fn latest_transformed_from_status_dir_returns_none_when_first_block_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        let status_dir = tmp.path().join("status");
+        fs::create_dir_all(&status_dir).unwrap();
+
+        fs::write(
+            status_dir.join("100.json"),
+            r#"{"transformed":false,"completed_handlers":["a"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            status_dir.join("101.json"),
+            r#"{"transformed":true,"completed_handlers":["a"]}"#,
+        )
+        .unwrap();
+
+        let latest = latest_transformed_from_status_dir(&status_dir).unwrap();
+        assert_eq!(latest, None);
     }
 }

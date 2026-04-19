@@ -28,13 +28,15 @@ ALTER TABLE IF EXISTS transfers RENAME COLUMN log_index TO log_position;
 
 ALTER TABLE IF EXISTS swaps ADD COLUMN IF NOT EXISTS log_position BIGINT;
 
--- Drop old constraint and create new one including log_position.
--- Constraint name comes from Postgres auto-naming: tablename_col1_col2_..._key
-DO $$
-BEGIN
-  ALTER TABLE swaps DROP CONSTRAINT IF EXISTS swaps_chain_id_tx_id_source_source_version_key;
-EXCEPTION WHEN undefined_object THEN NULL;
-END $$;
+-- Drop old constraints and create a new one including log_position.
+-- Upgraded databases keep the original auto-generated name even after
+-- tx_hash is renamed to tx_id, while already-normalized installs may have
+-- the tx_id-based variant.
+ALTER TABLE IF EXISTS swaps
+  DROP CONSTRAINT IF EXISTS swaps_chain_id_tx_hash_source_source_version_key;
+
+ALTER TABLE IF EXISTS swaps
+  DROP CONSTRAINT IF EXISTS swaps_chain_id_tx_id_source_source_version_key;
 
 ALTER TABLE IF EXISTS swaps
   ADD CONSTRAINT swaps_chain_id_tx_id_log_position_source_source_version_key

@@ -16,6 +16,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::types::chain::ChainType;
 use crate::types::config::contract::{Contracts, FactoryCollections};
+#[cfg(feature = "solana")]
 use crate::types::config::solana::SolanaPrograms;
 
 /// Generic helper to deduplicate handlers by their `handler_key()`.
@@ -972,6 +973,7 @@ pub fn validate_call_dependencies(
 /// Panics at startup with a descriptive message if any handler declares an
 /// `account_state_dependencies()` entry that is not configured for live
 /// account-state collection.
+#[cfg(feature = "solana")]
 pub fn validate_account_state_dependencies_for_solana(
     registry: &TransformationRegistry,
     programs: &SolanaPrograms,
@@ -1289,6 +1291,7 @@ mod tests {
         validate_call_dependencies(&registry, &contracts, &factory_collections);
     }
 
+    #[cfg(feature = "solana")]
     #[test]
     fn validate_solana_account_state_dependencies_passes_when_configured() {
         use crate::types::config::eth_call::Frequency;
@@ -1329,6 +1332,7 @@ mod tests {
         validate_account_state_dependencies_for_solana(&registry, &programs);
     }
 
+    #[cfg(feature = "solana")]
     #[test]
     #[should_panic(expected = "missing account-state dependency")]
     fn validate_solana_account_state_dependencies_panics_when_missing() {

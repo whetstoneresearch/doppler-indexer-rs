@@ -14,6 +14,9 @@ ALTER TABLE IF EXISTS tokens
 ALTER TABLE IF EXISTS _skipped_addresses
     RENAME COLUMN tx_hash TO tx_id;
 
+ALTER TABLE IF EXISTS swaps
+    RENAME COLUMN tx_hash TO tx_id;
+
 ALTER TABLE IF EXISTS pool_state
     RENAME COLUMN sqrt_price_x96 TO sqrt_price;
 
