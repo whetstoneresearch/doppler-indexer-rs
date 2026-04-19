@@ -3,7 +3,7 @@
         "address": [
             "0x98cd6478debe443069db863abb9626d94de9a544",
             "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
-            "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544"
+            "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544"
         ],
         "events": [
             {
@@ -90,7 +90,7 @@
         "address": [
             "0x0ed4c733f2642bd947b464a05acc848a9580eae7",
             "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
-            "0x636A756CeE08775CC18780F52dd90B634F18ad37",
+            "0x636a756cee08775cc18780f52dd90b634f18ad37",
             "0x3ec4798a9b11e8243a8db99687f7a23597b96623"
         ],
         "start_block": 35714991
@@ -102,7 +102,7 @@
             "0xf848fea3329185529b50228bcb36f3b5a60960c4",
             "0x8bbbe586f9a902c15a759fc134a99a2d28bc20c4"
         ],
-        "start_block": 26638492,
+        "start_block": 37876495,
         "events": [
             {
                 "signature": "Migrate(address indexed asset, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey)"
@@ -118,15 +118,17 @@
             "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
             "0x6477ae25bca3db3911af7cbb48a0ace38692720b",
             "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
-            "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
+            "0xd199e7836e91654c0475a90e0c1d0e402bb84372",
+            "0xea95dfdf69b90c65c827070852f7039d6af6dd7b"
         ],
-        "start_block": 26638492
+        "start_block": 37898403
     },
     "RehypeDopplerHookInitializer": {
         "address": [
-            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d",
-            "0x6ab5ae3191c914de8437431091776fc90f314be4"
+            "0xc918c6edb8e0b62b5b73b3f812249a986ba8066d",
+            "0x6ab5ae3191c914de8437431091776fc90f314be4",
+            "0xbf4195ab0b03e1eb3345dd1e83bed7650b1ed123"
         ],
-        "start_block": 26638492
+        "start_block": 38650035
     }
 }

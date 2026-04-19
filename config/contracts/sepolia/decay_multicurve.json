@@ -1,7 +1,7 @@
 {
     "DecayMulticurveInitializer": {
         "address": "0xd59ce43e53d69f190e15d9822fb4540dccc91178",
-        "start_block": 10134362,
+        "start_block": 10239729,
         "events": [
             {
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
@@ -60,7 +60,7 @@
     },
     "DecayMulticurveHook": {
         "address": "0xbb7784a4d481184283ed89619a3e3ed143e1adc0",
-        "start_block": 10134362,
+        "start_block": 10239728,
         "events": [
             {
                 "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)"

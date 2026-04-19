@@ -1,6 +1,9 @@
 {
     "UniswapV3Initializer": {
-        "address": "0x9F4e56be80f08ba1A2445645EFa6d231E27b43ec",
+        "address": [
+            "0x9f4e56be80f08ba1a2445645efa6d231e27b43ec",
+            "0xaa47d2977d622dbdfd33eef6a8276727c52eb4e5"
+        ],
         "factories": [
             {
                 "collection_name": "DopplerV3Pool",
@@ -50,6 +53,6 @@
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
             }
         ],
-        "start_block": 8537386
+        "start_block": 8532829
     }
 }

@@ -1,7 +1,11 @@
 {
     "UniswapV4MulticurveInitializer": {
-        "address": "0x65de470da664a5be139a5d812be5fda0d76cc951",
-        "start_block": 36178538,
+        "address": [
+            "0x65de470da664a5be139a5d812be5fda0d76cc951",
+            "0x4b0ec16eb40318ca5a4346f20f04a2285c19675b",
+            "0x917da361072ce968acd810bbfc9b64079426ebf0"
+        ],
+        "start_block": 35962085,
         "events": [
             {
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
@@ -59,7 +63,11 @@
         ]
     },
     "UniswapV4MulticurveInitializerHook": {
-        "address": "0x892d3c2b4abeaaf67d52a7b29783e2161b7cad40",
+        "address": [
+            "0x892d3c2b4abeaaf67d52a7b29783e2161b7cad40",
+            "0x0b295972a3febd121a0efebbe26c7fa8a6526d40",
+            "0x372bca585a2223a2e91a316cc32e81a05f006d40"
+        ],
         "events": [
             {
                 "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)"
@@ -104,6 +112,6 @@
                 ]
             }
         ],
-        "start_block": 36178540
+        "start_block": 35962087
     }
 }

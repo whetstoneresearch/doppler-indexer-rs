@@ -1,7 +1,7 @@
 {
     "UniswapV4PoolManager": {
-        "address": "0x1F98400000000000000000000000000000000004",
-        "start_block": 17686805,
+        "address": "0x1f98400000000000000000000000000000000004",
+        "start_block": 8532822,
         "events": [
             {
                 "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
@@ -16,10 +16,15 @@
     },
     "UniswapV4StateView": {
         "address": "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
-        "start_block": 17686805
+        "start_block": 8532822
     },
     "UniswapV4Initializer": {
-        "address": "0xA7A28cB18F73CDd591fa81ead6ffadf749c0d0a2",
+        "address": [
+            "0xa7a28cb18f73cdd591fa81ead6ffadf749c0d0a2",
+            "0x2f2bacd46d3f5c9ee052ab392b73711db89129db",
+            "0x4225c632b62622bd7b0a3ec9745c0a866ff94f6f",
+            "0x4b0ec16eb40318ca5a4346f20f04a2285c19675b"
+        ],
         "factories": [
             {
                 "collection_name": "DopplerV4Hook",
@@ -128,7 +133,7 @@
         "start_block": 23047748
     },
     "UniswapV4MigratorHook": {
-        "address": "0x53C050d3B09C80024138165520Bd7c078D9e2000",
+        "address": "0x53c050d3b09c80024138165520bd7c078d9e2000",
         "events": [
             {
                 "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"
@@ -156,7 +161,7 @@
         "start_block": 23047751
     },
     "DopplerLens": {
-        "address": "0x166109C4EE7fE69164631Caa937dAA5F5cEbFef0",
-        "start_block": 17686808
+        "address": "0x166109c4ee7fe69164631caa937daa5f5cebfef0",
+        "start_block": 8532822
     }
 }

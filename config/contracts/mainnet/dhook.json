@@ -4,7 +4,7 @@
             "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
             "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544"
         ],
-        "start_block": 24326115,
+        "start_block": 24340473,
         "events": [
             {
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
@@ -90,14 +90,14 @@
             "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
             "0x3ec4798a9b11e8243a8db99687f7a23597b96623"
         ],
-        "start_block": 24326115
+        "start_block": 24340583
     },
     "DopplerHookMigrator": {
         "address": [
             "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
             "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4"
         ],
-        "start_block": 24326115,
+        "start_block": 24521558,
         "events": [
             {
                 "signature": "Migrate(address indexed asset, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey)"
@@ -111,15 +111,17 @@
         "address": [
             "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
             "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
-            "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
+            "0xd199e7836e91654c0475a90e0c1d0e402bb84372",
+            "0xea95dfdf69b90c65c827070852f7039d6af6dd7b"
         ],
-        "start_block": 24326115
+        "start_block": 24521590
     },
     "RehypeDopplerHookInitializer": {
         "address": [
             "0x6ab5ae3191c914de8437431091776fc90f314be4",
-            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d"
+            "0xc918c6edb8e0b62b5b73b3f812249a986ba8066d",
+            "0xbf4195ab0b03e1eb3345dd1e83bed7650b1ed123"
         ],
-        "start_block": 24326115
+        "start_block": 24620668
     }
 }

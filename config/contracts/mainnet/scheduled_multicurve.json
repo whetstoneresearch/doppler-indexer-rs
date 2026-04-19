@@ -1,7 +1,7 @@
 {
     "UniswapV4ScheduledMulticurveInitializer": {
         "address": "0xf84378c9f39e0ff267f3101c88773359c5393876",
-        "start_block": 24326115,
+        "start_block": 24333452,
         "events": [
             {
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
@@ -60,7 +60,7 @@
     },
     "UniswapV4ScheduledMulticurveInitializerHook": {
         "address": "0xc6a562cb5cbfa29bcb1bdccf903b8b8f2e4a2dc0",
-        "start_block": 24326115,
+        "start_block": 24333452,
         "events": [
             {
                 "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)"

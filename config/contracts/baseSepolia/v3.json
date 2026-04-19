@@ -1,6 +1,22 @@
 {
     "UniswapV3Initializer": {
-        "address": "0x4c3062b9ccfdbcb10353f57c1b59a29d4c5cfa47",
+        "address": [
+            "0x4c3062b9ccfdbcb10353f57c1b59a29d4c5cfa47",
+            "0x0b2b6f7852851510f98bf18f59f8e18b065ea944",
+            "0x1b8f12484422583fed5694469f94c7839a823980",
+            "0x3c19ac8f42901f8e2e15edd9bf644a724614becf",
+            "0x620e3fec244e913d73f2163623b62d02db69638b",
+            "0x63f8c8f9befaab2facd7ece0b0242f78b920ee90",
+            "0x70d20cd48791e527036491dc464c8dc58351dd93",
+            "0x77ebfbae15ad200758e9e2e61597c0b07d731254",
+            "0x9581fd5de3ece5675136b4f9091bea1bed0fc27c",
+            "0x9916ec1c1e0462f6f8f7514e414f06bf001ac82a",
+            "0x9dfb775db7b005d9dc77da84d8b2e42c281d0344",
+            "0xb2569e9d32d4f90598e80bdf3c14b9a2f933626a",
+            "0xb327bb4307fa3426943a65ab2cf145fae21653b4",
+            "0xb5e6ee3baa67004259846ad151bb0a2d2836f12d",
+            "0xbed386a1fc62b6598c9b8d2bf634471b6fe75eb7"
+        ],
         "factories": [
             {
                 "collection_name": "DopplerV3Pool",
@@ -50,10 +66,14 @@
                 "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
             }
         ],
-        "start_block": 27471074
+        "start_block": 22100098
     },
     "LockableUniswapV3Initializer": {
-        "address": "0x1fb8a108ff5c16213ebe3456314858d6b069a23b",
+        "address": [
+            "0x1fb8a108ff5c16213ebe3456314858d6b069a23b",
+            "0x16ada5be50c3c2d94af5feae6b539c40a78ad53c",
+            "0xe3203fd6531ad6c1dd3c9b38e257f1aa6fbf9fb6"
+        ],
         "factories": [
             {
                 "collection_name": "DopplerLockableV3Pool",
@@ -106,10 +126,10 @@
                 "signature": "Lock(address indexed pool, (address beneficiary, uint96 shares)[] beneficiaries)"
             }
         ],
-        "start_block": 28110717
+        "start_block": 28070024
     },
     "UniswapV3Migrator": {
-        "address": "0x0A3d3678b31cfF5F926c2A0384E742E4747605A0",
-        "start_block": 28109000
+        "address": "0x0a3d3678b31cff5f926c2a0384e742e4747605a0",
+        "start_block": 22100097
     }
 }

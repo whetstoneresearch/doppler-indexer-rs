@@ -1,6 +1,23 @@
 {
     "Airlock": {
-        "address": "0x3411306ce66c9469bff1535ba955503c4bde1c6e",
+        "address": [
+            "0x3411306ce66c9469bff1535ba955503c4bde1c6e",
+            "0x0404073d30e1a4f8479b54c88beb824a08f6c7ee",
+            "0x094d926a969b3024ca46d2186bf13fd5cdba9ce2",
+            "0x0d2f38d807bfad5c18e430516e10ab560d300caf",
+            "0x193f48a45b6025dded10bc4baeef65c833696387",
+            "0x5be5b41cf8feeba9d8bf08fe957b8a5c68aaa155",
+            "0x5f3ba43d44375286296cb85f1ea2ebfa25dde731",
+            "0x7e5d336a6e9e453c9f02e5102cc039e015fd8fb8",
+            "0xa24e35a5d71d02a59b41e7c93567626302da1958",
+            "0xb1f44e39220ee3cebe08c8dba82d5255717b5224",
+            "0xbbe45b9fe9a63a891767f0669cca6b83c1d987c6",
+            "0xbe5ad4efe4085af00fd4a9e30b754cdcefe9c6ad",
+            "0xca1cc43d65684786f56f34384255ced201e8dc7e",
+            "0xdc923acd3f159b614a9593e9b4decd4c030d908d",
+            "0xe0dc4012ac9c868f09c6e4b20d66ed46d6f258d0",
+            "0xe7dfbd5b0a2c3b4464653a9becdc489229ef090e"
+        ],
         "factories": [
             {
                 "collection_name": "DERC20",
@@ -94,15 +111,15 @@
                 "signature": "Migrate(address indexed asset, address indexed pool)"
             }
         ],
-        "start_block": 27471070
+        "start_block": 22100097
     },
     "UniversalRouter": {
         "address": "0x492e6456d9528771018deb9e87ef7750ef184104",
-        "start_block": 28109000
+        "start_block": 22100097
     },
     "ChainlinkEthOracle": {
-        "address": "0x5b0cf2b36a65a6BB085D501B971e4c102B9Cd473",
-        "start_block": 28109000,
+        "address": "0x5b0cf2b36a65a6bb085d501b971e4c102b9cd473",
+        "start_block": 22100097,
         "calls": [
             {
                 "function": "latestAnswer()",
@@ -113,14 +130,14 @@
     },
     "ChainlinkUsdcOracle": {
         "address": "0xd30e2101a97dcbaebcbc04f14c3f624e67a35165",
-        "start_block": 28109000
+        "start_block": 22100097
     },
     "ChainlinkUsdtOracle": {
         "address": "0x3ec8593f930ea45ea58c968260e6e9ff53fc934f",
-        "start_block": 28109000
+        "start_block": 22100097
     },
     "Multicall3": {
-        "address": "0xcA11bde05977b3631167028862bE2a173976CA11",
-        "start_block": 28109000
+        "address": "0xca11bde05977b3631167028862be2a173976ca11",
+        "start_block": 22100097
     }
 }

@@ -5,6 +5,6 @@
     },
     "UniswapV2Migrator": {
         "address": "0x765875bff87614ce0581ee73b9fa663b71f3dff2",
-        "start_block": 24326115
+        "start_block": 24334164
     }
 }

@@ -20,7 +20,7 @@
     },
     "UniswapV4Initializer": {
         "address": "0x53b4c21a6cb61d64f636abbfa6e8e90e6558e8ad",
-        "start_block": 24326115,
+        "start_block": 24334663,
         "factories": [
             {
                 "collection_name": "DopplerV4Hook",
@@ -108,7 +108,7 @@
     },
     "UniswapV4Migrator": {
         "address": "0x0820a4d0173c17ece283f7bdaaf0f8876eb205f5",
-        "start_block": 24326115,
+        "start_block": 24334569,
         "factories": [
             {
                 "collection_name": "DopplerV4Pool",
@@ -129,7 +129,7 @@
     },
     "UniswapV4MigratorHook": {
         "address": "0x4053d4fa966cbdcc20ec62070ac8814de8bee500",
-        "start_block": 24326115,
+        "start_block": 24334568,
         "events": [
             {
                 "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"

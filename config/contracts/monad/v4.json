@@ -1,7 +1,7 @@
 {
     "UniswapV4PoolManager": {
         "address": "0x188d586ddcf52439676ca21a244753fa19f9ea8e",
-        "start_block": 34746371,
+        "start_block": 34746368,
         "events": [
             {
                 "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
@@ -16,11 +16,11 @@
     },
     "UniswapV4StateView": {
         "address": "0x77395f3b2e73ae90843717371294fa97cc419d64",
-        "start_block": 34746371
+        "start_block": 34746368
     },
     "UniswapV4Initializer": {
-        "address": "0x53b4c21a6Cb61D64F636ABBfa6E8E90E6558e8ad",
-        "start_block": 34746371,
+        "address": "0x53b4c21a6cb61d64f636abbfa6e8e90e6558e8ad",
+        "start_block": 49948736,
         "factories": [
             {
                 "collection_name": "DopplerV4Hook",

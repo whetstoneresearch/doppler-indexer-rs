@@ -60,7 +60,7 @@
     },
     "UniswapV4ScheduledMulticurveInitializerHook": {
         "address": "0x580ca49389d83b019d07e17e99454f2f218e2dc0",
-        "start_block": 34746368,
+        "start_block": 34746371,
         "events": [
             {
                 "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)"

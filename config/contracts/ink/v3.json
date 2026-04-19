@@ -1,7 +1,7 @@
 {
     "UniswapV3Initializer": {
-        "address": "0xaA47D2977d622DBdFD33eeF6a8276727c52EB4e5",
-        "start_block": 9508011,
+        "address": "0xaa47d2977d622dbdfd33eef6a8276727c52eb4e5",
+        "start_block": 9500886,
         "factories": [
             {
                 "collection_name": "DopplerV3Pool",
