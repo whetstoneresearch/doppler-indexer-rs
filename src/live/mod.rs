@@ -13,6 +13,7 @@ mod collector;
 mod compaction;
 mod error;
 mod eth_calls;
+mod leaderboard_snapshot;
 mod progress;
 mod reorg;
 mod storage;
@@ -22,11 +23,12 @@ pub use bincode_io::StorageError;
 pub use collector::{LiveCollector, LiveCollectorConfig};
 pub use compaction::{CompactionService, TransformRetryRequest};
 pub use eth_calls::LiveEthCallCollector;
+pub use leaderboard_snapshot::LeaderboardSnapshotService;
 pub use progress::{LiveProgressTracker, ProgressStatusStorage};
 pub use storage::LiveStorage;
 #[allow(unused_imports)]
 pub use types::{
-    LiveBlockStatus, LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,
-    LiveDecodedOnceCall, LiveEthCall, LiveMessage, LiveModeConfig, LivePipelineExpectations,
-    LiveUpsertSnapshot,
+    LeaderboardSnapshotConfig, LiveBlockStatus, LiveDbValue, LiveDecodedCall, LiveDecodedEventCall,
+    LiveDecodedLog, LiveDecodedOnceCall, LiveEthCall, LiveMessage, LiveModeConfig,
+    LivePipelineExpectations, LiveUpsertSnapshot,
 };

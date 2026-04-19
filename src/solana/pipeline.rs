@@ -967,6 +967,7 @@ async fn run_solana_live_mode(
         compaction_interval_secs: 60,
         range_size,
         transform_retry_grace_period_secs: 120,
+        leaderboard_snapshot: Some(crate::live::LeaderboardSnapshotConfig::default()),
     };
 
     let channel_capacity = config
@@ -1664,6 +1665,22 @@ async fn run_solana_live_mode(
             compaction.run().await;
             Ok(())
         });
+
+        if let (Some(pool), Some(snap_cfg)) = (
+            runtime.db_pool.clone(),
+            live_config.leaderboard_snapshot.clone(),
+        ) {
+            let snap_service = crate::live::LeaderboardSnapshotService::new(
+                chain.name.clone(),
+                chain.chain_id as u64,
+                pool,
+                snap_cfg,
+            );
+            tasks.spawn(async move {
+                snap_service.run().await;
+                Ok(())
+            });
+        }
     }
 
     // Transformation engine

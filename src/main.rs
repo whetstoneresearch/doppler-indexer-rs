@@ -31,8 +31,9 @@ use tracing_subscriber::EnvFilter;
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
-    CompactionService, LiveCollector, LiveCollectorConfig, LiveEthCallCollector, LiveMessage,
-    LiveModeConfig, LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
+    CompactionService, LeaderboardSnapshotConfig, LeaderboardSnapshotService, LiveCollector,
+    LiveCollectorConfig, LiveEthCallCollector, LiveMessage, LiveModeConfig,
+    LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
 };
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{
@@ -2316,6 +2317,7 @@ async fn spawn_live_mode(
             .raw_data_collection
             .transform_retry_grace_period_secs
             .unwrap_or(raw_data_defaults::TRANSFORM_RETRY_GRACE_PERIOD_SECS),
+        leaderboard_snapshot: Some(LeaderboardSnapshotConfig::default()),
     };
 
     tracing::info!(
@@ -2426,6 +2428,18 @@ async fn spawn_live_mode(
             .await
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });
+
+    // Start leaderboard snapshot service (one per live chain that has a DB).
+    if let (Some(pool), Some(snap_cfg)) =
+        (db_pool.clone(), live_config.leaderboard_snapshot.clone())
+    {
+        let snap_service =
+            LeaderboardSnapshotService::new(chain.name.clone(), chain.chain_id, pool, snap_cfg);
+        tasks.spawn(async move {
+            snap_service.run().await;
+            Ok(())
+        });
+    }
 
     // Start compaction service with retry channel
     let mut compaction = CompactionService::new(

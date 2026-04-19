@@ -1132,6 +1132,7 @@ mod tests {
             compaction_interval_secs: 1,
             range_size: 2,
             transform_retry_grace_period_secs: 300,
+            leaderboard_snapshot: None,
         };
 
         let disabled_expectations = LivePipelineExpectations::default();

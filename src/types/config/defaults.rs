@@ -64,6 +64,15 @@ pub mod raw_data {
 
     /// Default grace period in seconds before retrying stuck transformations
     pub const TRANSFORM_RETRY_GRACE_PERIOD_SECS: u64 = 300;
+
+    /// Default minimum blocks between leaderboard snapshots
+    pub const LEADERBOARD_SNAPSHOT_INTERVAL_BLOCKS: u64 = 100;
+
+    /// Default wall-clock interval in seconds for the leaderboard snapshot loop
+    pub const LEADERBOARD_SNAPSHOT_INTERVAL_SECS: u64 = 30;
+
+    /// Default retention window in seconds for leaderboard snapshots
+    pub const LEADERBOARD_SNAPSHOT_RETENTION_SECS: u64 = 3600;
 }
 
 /// RPC client defaults
@@ -159,6 +168,9 @@ mod tests {
         assert_eq!(raw_data::TRANSFORM_RETRY_GRACE_PERIOD_SECS, 300);
         assert_eq!(raw_data::EVENT_CALL_WINDOW_MULTIPLIER, 3);
         assert_eq!(raw_data::EVENT_CALL_TRIGGER_BATCH_SIZE, 50000);
+        assert_eq!(raw_data::LEADERBOARD_SNAPSHOT_INTERVAL_BLOCKS, 100);
+        assert_eq!(raw_data::LEADERBOARD_SNAPSHOT_INTERVAL_SECS, 30);
+        assert_eq!(raw_data::LEADERBOARD_SNAPSHOT_RETENTION_SECS, 3600);
     }
 
     #[test]

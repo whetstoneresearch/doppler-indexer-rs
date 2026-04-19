@@ -202,6 +202,37 @@ pub struct LiveFactoryAddresses {
     pub addresses_by_collection: HashMap<String, Vec<(u64, [u8; 20])>>,
 }
 
+/// Configuration for the periodic leaderboard snapshot writer.
+///
+/// `None` on `LiveModeConfig::leaderboard_snapshot` disables the feature.
+#[derive(Debug, Clone)]
+pub struct LeaderboardSnapshotConfig {
+    /// Minimum blocks between snapshots; snapshot is skipped if fewer have passed.
+    pub interval_blocks: u64,
+    /// Wall-clock interval in seconds for the snapshot loop (cadence floor).
+    pub interval_secs: u64,
+    /// Retention window in seconds; snapshots older than this are GC'd.
+    pub retention_secs: u64,
+    /// Sort keys to materialize. Each cycle inserts one row per (sort_key, pool).
+    pub sort_keys: Vec<String>,
+}
+
+impl Default for LeaderboardSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            interval_blocks: defaults::LEADERBOARD_SNAPSHOT_INTERVAL_BLOCKS,
+            interval_secs: defaults::LEADERBOARD_SNAPSHOT_INTERVAL_SECS,
+            retention_secs: defaults::LEADERBOARD_SNAPSHOT_RETENTION_SECS,
+            sort_keys: vec![
+                "active_liquidity_usd".to_string(),
+                "tvl_usd".to_string(),
+                "volume_24h_usd".to_string(),
+                "market_cap_usd".to_string(),
+            ],
+        }
+    }
+}
+
 /// Configuration for live mode.
 #[derive(Debug, Clone)]
 pub struct LiveModeConfig {
@@ -213,6 +244,8 @@ pub struct LiveModeConfig {
     pub range_size: u64,
     /// Grace period in seconds before retrying stuck transformations.
     pub transform_retry_grace_period_secs: u64,
+    /// When set, spawns the leaderboard snapshot writer for this chain.
+    pub leaderboard_snapshot: Option<LeaderboardSnapshotConfig>,
 }
 
 impl Default for LiveModeConfig {
@@ -222,6 +255,7 @@ impl Default for LiveModeConfig {
             compaction_interval_secs: defaults::COMPACTION_INTERVAL_SECS,
             range_size: 1000,
             transform_retry_grace_period_secs: defaults::TRANSFORM_RETRY_GRACE_PERIOD_SECS,
+            leaderboard_snapshot: None,
         }
     }
 }

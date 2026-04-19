@@ -213,6 +213,12 @@ migrations/
 - **entry_points**: `src/solana/live/collector.rs`, `src/solana/live/reorg.rs`, `src/solana/live/storage.rs`, `src/solana/pipeline.rs`
 - **depends_on**: [solana_raw_data, solana_rpc, live_mode]
 
+### leaderboard_snapshots
+- **description**: Periodic materialization of `pool_state` rankings into `pool_leaderboard_snapshot`, keyed by a monotonic `snapshot_id`. Backs stable O(log N + limit) keyset pagination on mutable sort keys (active_liquidity_usd, tvl_usd, volume_24h_usd, market_cap_usd). Old snapshots are time-GC'd; snapshots capturing reorged state are range-deleted by the reorg finalizer.
+- **entry_points**: `src/live/leaderboard_snapshot.rs`, `migrations/007_pool_leaderboard_snapshot.sql`, `src/transformations/finalizer.rs` (reorg Phase 4)
+- **depends_on**: [live_mode, transformations, database]
+- **doc**: `docs/features/leaderboard_snapshots.md`
+
 ---
 
 ## Project Structure

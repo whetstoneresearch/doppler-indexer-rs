@@ -461,6 +461,44 @@ impl RangeFinalizer {
         // Phase 3: Clean up _live_progress entries
         self.cleanup_live_progress(orphaned).await?;
 
+        // Phase 4: Invalidate leaderboard snapshots that captured orphaned state.
+        // Unlike per-block tables, a snapshot taken *after* an orphaned block also
+        // reflects orphaned state, so the deletion is range-based on block_height
+        // rather than set-based on IN(orphaned).
+        self.invalidate_leaderboard_snapshots(orphaned).await?;
+
+        Ok(())
+    }
+
+    /// Delete every `pool_leaderboard_snapshot` row for this chain whose
+    /// `block_height` is at or after the minimum orphaned block. Clients
+    /// holding a cursor to a deleted snapshot receive `INVALID_CURSOR` on
+    /// their next request and restart their session.
+    async fn invalidate_leaderboard_snapshots(
+        &self,
+        orphaned: &[u64],
+    ) -> Result<(), TransformationError> {
+        let Some(&min_orphaned) = orphaned.iter().min() else {
+            return Ok(());
+        };
+
+        let ops = vec![DbOperation::Delete {
+            table: "pool_leaderboard_snapshot".to_string(),
+            where_clause: WhereClause::Raw {
+                condition: format!(
+                    "chain_id = {} AND block_height >= {}",
+                    self.chain_id, min_orphaned
+                ),
+                params: vec![],
+            },
+        }];
+
+        tracing::debug!(
+            "Reorg cleanup: deleting leaderboard snapshots with block_height >= {}",
+            min_orphaned
+        );
+        self.db_pool.execute_transaction(ops).await?;
+
         Ok(())
     }
 

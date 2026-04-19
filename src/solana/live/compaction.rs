@@ -641,6 +641,7 @@ mod tests {
             compaction_interval_secs: 10,
             range_size,
             transform_retry_grace_period_secs: 30,
+            leaderboard_snapshot: None,
         }
     }
 
@@ -1146,6 +1147,7 @@ mod tests {
             range_size: 1000,
             // Very long grace period so nothing triggers during test
             transform_retry_grace_period_secs: 3600,
+            leaderboard_snapshot: None,
         };
 
         let (retry_tx, mut retry_rx) = mpsc::channel(10);
