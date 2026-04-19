@@ -843,13 +843,16 @@ pub(crate) fn load_factory_addresses_from_parquet(
                 }
             }
 
-            if !addresses_by_block.is_empty() {
-                results.push(FactoryAddressData {
-                    range_start,
-                    range_end,
-                    addresses_by_block,
-                });
-            }
+            // Include empty ranges too: callers (repair-only factory-once
+            // fallback, Phase C event-trigger filtering) must see every range
+            // that was collected, including ones with zero addresses, so
+            // empty `once` output parquets get written as readiness markers
+            // rather than leaving a hole that stalls transformation catchup.
+            results.push(FactoryAddressData {
+                range_start,
+                range_end,
+                addresses_by_block,
+            });
         }
     }
 
