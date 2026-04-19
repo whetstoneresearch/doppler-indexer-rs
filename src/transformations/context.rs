@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
+use serde::{Deserialize, Serialize};
 
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
@@ -151,7 +152,7 @@ pub trait FieldExtractor {
 }
 
 /// A decoded event ready for transformation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct DecodedEvent {
     pub block_number: u64,
@@ -237,7 +238,7 @@ impl FieldExtractor for DecodedEvent {
 }
 
 /// A decoded eth_call result ready for transformation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct DecodedCall {
     pub block_number: u64,
@@ -302,7 +303,7 @@ impl FieldExtractor for DecodedCall {
 }
 
 /// A decoded Solana account state ready for transformation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct DecodedAccountState {
     pub block_number: u64,

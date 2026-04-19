@@ -277,6 +277,23 @@ pub async fn decode_solana_events(
                         if events.is_empty() {
                             continue;
                         }
+                        if let Some(ref storage) = live_storage {
+                            if let Err(e) = storage.write_decoded(
+                                "events",
+                                range_start,
+                                &source_name,
+                                &event_name,
+                                &events,
+                            ) {
+                                tracing::warn!(
+                                    slot = range_start,
+                                    source = %source_name,
+                                    event = %event_name,
+                                    error = %e,
+                                    "Failed to persist decoded live events"
+                                );
+                            }
+                        }
                         if tx
                             .send(DecodedEventsMessage {
                                 range_start,
@@ -468,6 +485,23 @@ pub async fn decode_solana_instructions(
                     for ((source_name, event_name), events) in by_trigger {
                         if events.is_empty() {
                             continue;
+                        }
+                        if let Some(ref storage) = live_storage {
+                            if let Err(e) = storage.write_decoded(
+                                "instructions",
+                                range_start,
+                                &source_name,
+                                &event_name,
+                                &events,
+                            ) {
+                                tracing::warn!(
+                                    slot = range_start,
+                                    source = %source_name,
+                                    instruction = %event_name,
+                                    error = %e,
+                                    "Failed to persist decoded live instructions"
+                                );
+                            }
                         }
                         if tx
                             .send(DecodedEventsMessage {

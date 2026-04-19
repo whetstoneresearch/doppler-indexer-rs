@@ -667,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
                             &config,
                             &chain,
                             shared_db_pool,
+                            transformation_handlers.as_ref(),
                         )
                         .await
                     } else {
@@ -712,6 +713,7 @@ async fn main() -> anyhow::Result<()> {
                         repair,
                         repair_scope,
                         shared_db_pool,
+                        transformation_handlers.as_ref(),
                     )
                     .await
                 } else {
@@ -1036,6 +1038,7 @@ async fn transformation_only_chain(
         TransformationEngineConfig {
             chain_name: chain.name.clone(),
             chain_id: chain.chain_id,
+            chain_type: chain.chain_type,
             mode,
             contracts: chain.contracts.clone(),
             factory_collections: chain.factory_collections.clone(),
@@ -1258,6 +1261,7 @@ async fn process_chain_live_only(
             TransformationEngineConfig {
                 chain_name: chain.name.clone(),
                 chain_id: chain.chain_id,
+                chain_type: chain.chain_type,
                 mode: ExecutionMode::Streaming, // Live-only mode always uses streaming
                 contracts: chain.contracts.clone(),
                 factory_collections: chain.factory_collections.clone(),
@@ -2117,6 +2121,7 @@ async fn process_chain(
             TransformationEngineConfig {
                 chain_name: pipeline.runtime.chain.name.clone(),
                 chain_id: pipeline.runtime.chain.chain_id,
+                chain_type: pipeline.runtime.chain.chain_type,
                 mode,
                 contracts: pipeline.runtime.chain.contracts.clone(),
                 factory_collections: pipeline.runtime.chain.factory_collections.clone(),

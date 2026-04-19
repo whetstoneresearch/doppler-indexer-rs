@@ -87,6 +87,12 @@ pub fn decoded_solana_instructions_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/historical/decoded/instructions", chain))
 }
 
+/// `data/{chain}/historical/decoded/accounts`
+#[cfg(feature = "solana")]
+pub fn decoded_solana_accounts_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/accounts", chain))
+}
+
 // ---------------------------------------------------------------------------
 // EVM decoded path builders
 // ---------------------------------------------------------------------------

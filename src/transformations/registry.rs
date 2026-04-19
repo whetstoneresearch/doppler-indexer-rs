@@ -16,6 +16,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::types::chain::ChainType;
 use crate::types::config::contract::{Contracts, FactoryCollections};
+use crate::types::config::solana::SolanaPrograms;
 
 /// Generic helper to deduplicate handlers by their `handler_key()`.
 ///
@@ -965,6 +966,73 @@ pub fn validate_call_dependencies(
     }
 }
 
+/// Validate that all Solana handler account_state_dependencies are satisfied by
+/// the configured account-read availability.
+///
+/// Panics at startup with a descriptive message if any handler declares an
+/// `account_state_dependencies()` entry that is not configured for live
+/// account-state collection.
+pub fn validate_account_state_dependencies_for_solana(
+    registry: &TransformationRegistry,
+    programs: &SolanaPrograms,
+) {
+    let available: HashSet<(String, String)> = programs
+        .iter()
+        .flat_map(|(program_name, program_config)| {
+            program_config.accounts.iter().flat_map(move |accounts| {
+                accounts
+                    .iter()
+                    .map(move |account| (program_name.clone(), account.account_type.clone()))
+            })
+        })
+        .collect();
+
+    let mut all_missing: Vec<(String, Vec<(String, String)>)> = Vec::new();
+
+    for handler_info in registry.unique_event_handlers() {
+        if handler_info.handler.chain_type() != ChainType::Solana {
+            continue;
+        }
+
+        let deps = handler_info.handler.account_state_dependencies();
+        if deps.is_empty() {
+            continue;
+        }
+
+        let missing: Vec<(String, String)> = deps
+            .into_iter()
+            .filter(|dependency| !available.contains(dependency))
+            .collect();
+
+        if !missing.is_empty() {
+            all_missing.push((handler_info.handler.handler_key(), missing));
+        }
+    }
+
+    if all_missing.is_empty() {
+        return;
+    }
+
+    let mut msg = String::from(
+        "missing account-state dependency: one or more Solana handlers declare \
+         account_state_dependencies that are not configured for account reads:\n",
+    );
+    for (handler_key, missing) in &all_missing {
+        msg.push_str(&format!("\n  Handler '{}':\n", handler_key));
+        for (source, account_type) in missing {
+            msg.push_str(&format!("    - ({}, {})\n", source, account_type));
+        }
+    }
+    msg.push_str("\nAvailable Solana account-state configs:\n");
+    let mut sorted_available: Vec<_> = available.iter().collect();
+    sorted_available.sort();
+    for (source, account_type) in &sorted_available {
+        msg.push_str(&format!("    - ({}, {})\n", source, account_type));
+    }
+    msg.push_str("\nCheck your Solana program config files to ensure all required account reads are configured.");
+    panic!("{}", msg);
+}
+
 /// Build the transformation registry with all handlers (unfiltered).
 ///
 /// This is where handlers are registered at compile-time.
@@ -1096,8 +1164,10 @@ mod tests {
     /// A mock event handler for testing call dependency validation.
     struct MockEventHandler {
         name: &'static str,
+        chain_type: ChainType,
         triggers: Vec<EventTrigger>,
         call_deps: Vec<(String, String)>,
+        account_state_deps: Vec<(String, String)>,
         handler_deps: Vec<&'static str>,
         contiguous_handler_deps: Vec<&'static str>,
         handler_dep_specs: Vec<HandlerDependencySpec>,
@@ -1108,6 +1178,10 @@ mod tests {
     impl TransformationHandler for MockEventHandler {
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn chain_type(&self) -> ChainType {
+            self.chain_type
         }
 
         async fn handle(
@@ -1125,6 +1199,10 @@ mod tests {
 
         fn call_dependencies(&self) -> Vec<(String, String)> {
             self.call_deps.clone()
+        }
+
+        fn account_state_dependencies(&self) -> Vec<(String, String)> {
+            self.account_state_deps.clone()
         }
 
         fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
@@ -1165,8 +1243,10 @@ mod tests {
     fn mock_handler(name: &'static str, handler_deps: Vec<&'static str>) -> MockEventHandler {
         MockEventHandler {
             name,
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", format!("{}()", name))],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps,
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1189,11 +1269,13 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new(
                 "TestContract",
                 "Transfer(address,address,uint256)",
             )],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1208,6 +1290,65 @@ mod tests {
     }
 
     #[test]
+    fn validate_solana_account_state_dependencies_passes_when_configured() {
+        use crate::types::config::eth_call::Frequency;
+        use crate::types::config::solana::{SolanaAccountReadConfig, SolanaProgramConfig};
+
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "solana_handler",
+            chain_type: ChainType::Solana,
+            triggers: vec![EventTrigger::new("DopplerCPMM", "Swap")],
+            call_deps: vec![],
+            account_state_deps: vec![("DopplerCPMM".to_string(), "Pool".to_string())],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        let mut programs = SolanaPrograms::new();
+        programs.insert(
+            "DopplerCPMM".to_string(),
+            SolanaProgramConfig {
+                program_id: "11111111111111111111111111111111".to_string(),
+                idl_path: None,
+                idl_format: None,
+                decoder: None,
+                events: None,
+                accounts: Some(vec![SolanaAccountReadConfig {
+                    name: "pool".to_string(),
+                    account_type: "Pool".to_string(),
+                    frequency: Frequency::default(),
+                }]),
+                discovery: None,
+                start_slot: None,
+            },
+        );
+
+        validate_account_state_dependencies_for_solana(&registry, &programs);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing account-state dependency")]
+    fn validate_solana_account_state_dependencies_panics_when_missing() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "solana_handler",
+            chain_type: ChainType::Solana,
+            triggers: vec![EventTrigger::new("DopplerCPMM", "Swap")],
+            call_deps: vec![],
+            account_state_deps: vec![("DopplerCPMM".to_string(), "Pool".to_string())],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        validate_account_state_dependencies_for_solana(&registry, &SolanaPrograms::new());
+    }
+
+    #[test]
     fn validate_handler_with_satisfied_periodic_dep_passes() {
         use crate::types::config::contract::AddressOrAddresses;
         use crate::types::config::contract::ContractConfig;
@@ -1217,8 +1358,10 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1255,8 +1398,10 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1281,8 +1426,10 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1323,8 +1470,10 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1464,8 +1613,10 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "B",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "B()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![dep("A")],
@@ -1490,8 +1641,10 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "B",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "B()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![dep("A").only([8453, 1])],
@@ -1513,8 +1666,10 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "B",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "B()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![dep("A").except([143, 57073])],
@@ -1532,8 +1687,10 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "B",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "B()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![dep("A").only([8453])],
@@ -1554,8 +1711,10 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "B",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "B()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![dep("A").only([8453])],
@@ -1681,11 +1840,13 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "multi",
+            chain_type: ChainType::Evm,
             triggers: vec![
                 EventTrigger::new("Source1", "Event1()"),
                 EventTrigger::new("Source2", "Event2()"),
             ],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
             handler_dep_specs: vec![],
@@ -1700,8 +1861,10 @@ mod tests {
         registry.register_event_handler(mock_handler("Create", vec![]));
         registry.register_event_handler(MockEventHandler {
             name: "Metrics",
+            chain_type: ChainType::Evm,
             triggers: vec![EventTrigger::new("Test", "Metrics()")],
             call_deps: vec![],
+            account_state_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec!["Create"],
             handler_dep_specs: vec![],

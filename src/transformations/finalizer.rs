@@ -346,9 +346,11 @@ impl RangeFinalizer {
             .iter()
             .map(|handler| {
                 let error_message = format!(
-                    "Timed out after {}s waiting on call deps {:?} and handler deps {:?} while processing {}/{}",
+                    "Timed out after {}s waiting on call deps {:?}, required account states {:?}, optional account states {:?}, and handler deps {:?} while processing {}/{}",
                     handler.timed_out_after_secs,
                     handler.required_calls,
+                    handler.required_account_states,
+                    handler.optional_account_states,
                     handler.required_handlers,
                     handler.source_name,
                     handler.event_name,
@@ -357,6 +359,8 @@ impl RangeFinalizer {
                     "source_name": handler.source_name,
                     "event_name": handler.event_name,
                     "required_calls": handler.required_calls,
+                    "required_account_states": handler.required_account_states,
+                    "optional_account_states": handler.optional_account_states,
                     "required_handlers": handler.required_handlers,
                     "timed_out_after_secs": handler.timed_out_after_secs,
                 });

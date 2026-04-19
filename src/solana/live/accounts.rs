@@ -495,8 +495,17 @@ impl SolanaLiveAccountReader {
             );
         }
 
-        // Send decoded states downstream, grouped by (effective_source, account_type).
+        // Persist decoded states for retry and send them downstream, grouped by
+        // (effective_source, account_type).
         for ((effective_source, account_type), states) in decoded_by_source_and_type {
+            self.storage.write_decoded(
+                "accounts",
+                slot,
+                &effective_source,
+                &account_type,
+                &states,
+            )?;
+
             let msg = DecodedAccountStatesMessage {
                 range_start: slot,
                 range_end: slot + 1,

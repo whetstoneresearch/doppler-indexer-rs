@@ -273,6 +273,29 @@ pub trait EventHandler: TransformationHandler {
         vec![]
     }
 
+    /// Declare decoded account-state types this handler requires in its
+    /// execution context.
+    ///
+    /// Like `call_dependencies()`, these are hard dependencies:
+    /// the handler must not execute until every declared `(source, account_type)`
+    /// dependency is available for the range. If the account-state stream
+    /// completes without a declared dependency arriving, the handler fails for
+    /// that range.
+    fn account_state_dependencies(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+
+    /// Declare decoded account-state types this handler can use when present,
+    /// but can safely execute without.
+    ///
+    /// Optional account states are loaded into the handler context just like
+    /// hard dependencies. In live mode, the engine waits for them until the
+    /// account-state stream closes for the range; if they never arrive, the
+    /// handler still executes.
+    fn optional_account_state_dependencies(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+
     /// Declarative same-range handler dependencies. Defaults to wrapping the
     /// legacy string-only dependency API so existing handlers remain unchanged.
     fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {

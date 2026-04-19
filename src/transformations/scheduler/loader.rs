@@ -6,7 +6,7 @@
 //! - [`CatchupPayload`]: opaque payload carried in a [`WorkItem`].
 //! - [`CatchupLoader`]: executes one [`WorkItem`] end-to-end.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +16,9 @@ use super::dag::WorkItem;
 use crate::db::DbPool;
 use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
-use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
+use crate::transformations::context::{
+    DecodedAccountState, DecodedCall, DecodedEvent, TransactionAddresses,
+};
 use crate::transformations::engine::HandlerKind;
 use crate::transformations::error::TransformationError;
 use crate::transformations::executor::{run_handler_task, DbExecMode};
@@ -24,8 +26,13 @@ use crate::transformations::finalizer::RangeFinalizer;
 use crate::transformations::historical::HistoricalDataReader;
 use crate::transformations::retry::{filter_calls_by_start_block, filter_events_by_start_block};
 use crate::transformations::traits::TransformationHandler;
-use crate::types::chain::{ChainAddress, TxId};
+use crate::types::chain::{ChainAddress, ChainType, TxId};
 use crate::types::config::contract::Contracts;
+
+#[cfg(feature = "solana")]
+use crate::solana::decoding::decoded_parquet::{
+    read_decoded_account_states_from_parquet, read_decoded_events_from_parquet,
+};
 
 // ─── Free functions ──────────────────────────────────────────────────────────
 
@@ -105,6 +112,40 @@ where
     }
 
     Ok(all_items)
+}
+
+fn missing_loaded_account_state_dependencies(
+    required_dependencies: &[(String, String)],
+    account_states: &[DecodedAccountState],
+) -> Vec<(String, String)> {
+    let available_dependencies: HashSet<(String, String)> = account_states
+        .iter()
+        .map(|account_state| {
+            (
+                account_state.source_name.clone(),
+                account_state.account_type.clone(),
+            )
+        })
+        .collect();
+
+    required_dependencies
+        .iter()
+        .filter(|dependency| !available_dependencies.contains(*dependency))
+        .cloned()
+        .collect()
+}
+
+fn merge_account_state_dependencies(
+    required: &[(String, String)],
+    optional: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = Vec::with_capacity(required.len() + optional.len());
+    for dependency in required.iter().chain(optional.iter()) {
+        if !merged.contains(dependency) {
+            merged.push(dependency.clone());
+        }
+    }
+    merged
 }
 
 /// Read transaction addresses from a receipts parquet file.
@@ -288,6 +329,8 @@ pub(crate) struct CatchupPayload {
     pub handler_version: u32,
     pub triggers: Arc<Vec<(String, String)>>,
     pub call_deps: Arc<Vec<(String, String)>>,
+    pub account_state_deps: Arc<Vec<(String, String)>>,
+    pub optional_account_state_deps: Arc<Vec<(String, String)>>,
     pub kind: HandlerKind,
 }
 
@@ -301,8 +344,10 @@ type ReceiptCache =
 /// Constructed once per `run_handler_catchup` invocation and shared via `Arc`
 /// across all spawned tasks inside [`DagScheduler::execute`].
 pub(crate) struct CatchupLoader {
-    pub decoded_logs_dir: PathBuf,
+    pub chain_type: ChainType,
+    pub decoded_event_dirs: Vec<PathBuf>,
     pub decoded_calls_dir: PathBuf,
+    pub decoded_account_states_dir: Option<PathBuf>,
     pub raw_receipts_dir: PathBuf,
     pub historical_reader: Arc<HistoricalDataReader>,
     pub rpc_client: Option<Arc<UnifiedRpcClient>>,
@@ -339,7 +384,7 @@ impl CatchupLoader {
 
         let handler_key = &payload.handler_key;
 
-        let (events, calls) = match payload.kind {
+        let (events, calls, account_states) = match payload.kind {
             HandlerKind::Event => {
                 let evts = self
                     .load_events(range_start, range_end, &payload.triggers)
@@ -355,14 +400,40 @@ impl CatchupLoader {
                     Vec::new()
                 };
 
-                (evts, calls)
+                let all_account_state_deps = merge_account_state_dependencies(
+                    &payload.account_state_deps,
+                    &payload.optional_account_state_deps,
+                );
+                let account_states = if !evts.is_empty() && !all_account_state_deps.is_empty() {
+                    self.load_account_states(range_start, range_end, &all_account_state_deps)
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                if !evts.is_empty() && !payload.account_state_deps.is_empty() {
+                    let missing_dependencies = missing_loaded_account_state_dependencies(
+                        &payload.account_state_deps,
+                        &account_states,
+                    );
+                    if !missing_dependencies.is_empty() {
+                        return Err(TransformationError::MissingData(format!(
+                            "missing hard account-state dependencies for catchup handler {} in range {}-{}: {:?}",
+                            handler_key,
+                            range_start,
+                            range_end,
+                            missing_dependencies,
+                        )));
+                    }
+                }
+
+                (evts, calls, account_states)
             }
             HandlerKind::Call => {
                 let raw_calls = self
                     .load_calls(range_start, range_end, &payload.triggers)
                     .await?;
                 let calls = filter_calls_by_start_block(self.contracts.as_deref(), raw_calls);
-                (Vec::new(), calls)
+                (Vec::new(), calls, Vec::new())
             }
         };
 
@@ -390,7 +461,7 @@ impl CatchupLoader {
             payload.handler,
             Arc::new(events),
             Arc::new(calls),
-            Arc::new(Vec::new()),
+            Arc::new(account_states),
             tx_addresses,
             self.chain_name.clone(),
             self.chain_id,
@@ -448,15 +519,63 @@ impl CatchupLoader {
         triggers: &[(String, String)],
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
         let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-        let logs_dir = self.decoded_logs_dir.clone();
+        match self.chain_type {
+            ChainType::Evm => {
+                let logs_dir = self.decoded_event_dirs.first().cloned().unwrap_or_default();
+                read_decoded_parquet(
+                    self.historical_reader.clone(),
+                    triggers,
+                    move |source, event| vec![logs_dir.join(source).join(event).join(&file_name)],
+                    |reader, path, src, evt| reader.read_events_from_file(path, src, evt),
+                )
+                .await
+            }
+            ChainType::Solana => {
+                #[cfg(feature = "solana")]
+                {
+                    let mut tasks: JoinSet<Result<Vec<DecodedEvent>, TransformationError>> =
+                        JoinSet::new();
+                    for (source, trigger_name) in triggers {
+                        for base_dir in &self.decoded_event_dirs {
+                            let path = base_dir.join(source).join(trigger_name).join(&file_name);
+                            if !path.exists() {
+                                continue;
+                            }
+                            tasks.spawn_blocking(move || {
+                                read_decoded_events_from_parquet(&path)
+                                    .map_err(TransformationError::IoError)
+                            });
+                        }
+                    }
 
-        read_decoded_parquet(
-            self.historical_reader.clone(),
-            triggers,
-            move |source, event| vec![logs_dir.join(source).join(event).join(&file_name)],
-            |reader, path, src, evt| reader.read_events_from_file(path, src, evt),
-        )
-        .await
+                    let mut events = Vec::new();
+                    while let Some(result) = tasks.join_next().await {
+                        match result {
+                            Ok(Ok(mut batch)) => events.append(&mut batch),
+                            Ok(Err(error)) => return Err(error),
+                            Err(error) => {
+                                return Err(TransformationError::IoError(std::io::Error::other(
+                                    error.to_string(),
+                                )))
+                            }
+                        }
+                    }
+                    events.sort_by_key(|event| {
+                        (
+                            event.block_number,
+                            event.position.ordinal(),
+                            event.source_name.clone(),
+                            event.event_name.clone(),
+                        )
+                    });
+                    Ok(events)
+                }
+                #[cfg(not(feature = "solana"))]
+                {
+                    Ok(Vec::new())
+                }
+            }
+        }
     }
 
     async fn load_calls(
@@ -490,11 +609,58 @@ impl CatchupLoader {
         )
         .await
     }
+
+    async fn load_account_states(
+        &self,
+        range_start: u64,
+        range_end: u64,
+        deps: &[(String, String)],
+    ) -> Result<Vec<DecodedAccountState>, TransformationError> {
+        let Some(base_dir) = self.decoded_account_states_dir.clone() else {
+            return Ok(Vec::new());
+        };
+        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+
+        #[cfg(feature = "solana")]
+        {
+            let mut tasks: JoinSet<Result<Vec<DecodedAccountState>, TransformationError>> =
+                JoinSet::new();
+
+            for (source, account_type) in deps {
+                let path = base_dir.join(source).join(account_type).join(&file_name);
+                if !path.exists() {
+                    continue;
+                }
+                tasks.spawn_blocking(move || {
+                    read_decoded_account_states_from_parquet(&path)
+                        .map_err(TransformationError::IoError)
+                });
+            }
+
+            let mut account_states = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(mut batch)) => account_states.append(&mut batch),
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(TransformationError::IoError(std::io::Error::other(
+                            error.to_string(),
+                        )))
+                    }
+                }
+            }
+
+            Ok(account_states)
+        }
+        #[cfg(not(feature = "solana"))]
+        {
+            let _ = (base_dir, deps);
+            Ok(Vec::new())
+        }
+    }
 }
 
 // ─── CallDepScanner ────────────────────────────────────────────────────────
-
-use std::collections::HashSet;
 
 use crate::storage::contract_index::build_expected_factory_contracts_for_range;
 use crate::transformations::engine::call_dependency_contract_index_complete;
@@ -675,6 +841,9 @@ pub(crate) async fn run_call_dep_scanner_loop(
 mod tests {
     use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
     use super::super::tracker::CompletionTracker;
+    use super::*;
+    use crate::transformations::context::{DecodedAccountState, DecodedValue};
+    use crate::types::chain::ChainAddress;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
     use std::sync::Arc;
@@ -773,6 +942,28 @@ mod tests {
             .iter()
             .position(|(n, r, k)| n == name && *r == range && *k == "end")
             .unwrap_or_else(|| panic!("no end event for {}:{}", name, range))
+    }
+
+    #[test]
+    fn missing_loaded_account_state_dependencies_reports_absent_pairs() {
+        let required = vec![
+            ("DopplerCPMM".to_string(), "Pool".to_string()),
+            ("DopplerCPMM".to_string(), "Position".to_string()),
+        ];
+        let loaded = vec![DecodedAccountState {
+            block_number: 42,
+            block_timestamp: 1_700_000_000,
+            account_address: ChainAddress::Solana([1; 32]),
+            owner_program: ChainAddress::Solana([2; 32]),
+            source_name: "DopplerCPMM".to_string(),
+            account_type: "Pool".to_string(),
+            fields: HashMap::from([(Arc::from("reserve0"), DecodedValue::Uint64(1))]),
+        }];
+
+        assert_eq!(
+            missing_loaded_account_state_dependencies(&required, &loaded),
+            vec![("DopplerCPMM".to_string(), "Position".to_string())]
+        );
     }
 
     /// Simulates the engine's multi-pass build-items-with-deferral logic.

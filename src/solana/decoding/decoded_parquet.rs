@@ -13,8 +13,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::transformations::context::DecodedEvent;
+use crate::transformations::context::{DecodedAccountState, DecodedEvent};
 use crate::types::chain::{ChainAddress, LogPosition, TxId};
 use crate::types::decoded::DecodedValue;
 
@@ -48,6 +49,19 @@ pub fn build_decoded_event_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Build the Arrow schema for decoded Solana account-state parquet files.
+pub fn build_decoded_account_state_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("block_timestamp", DataType::UInt64, false),
+        Field::new("account_address", DataType::FixedSizeBinary(32), false),
+        Field::new("owner_program", DataType::FixedSizeBinary(32), false),
+        Field::new("source_name", DataType::Utf8, false),
+        Field::new("account_type", DataType::Utf8, false),
+        Field::new("fields", DataType::Utf8, false),
+    ]))
+}
+
 /// Extract the Solana transaction signature bytes from a [`TxId`].
 fn tx_signature_bytes(tx_id: &TxId) -> [u8; 64] {
     match tx_id {
@@ -58,6 +72,13 @@ fn tx_signature_bytes(tx_id: &TxId) -> [u8; 64] {
 
 /// Extract the Solana program ID bytes from a [`ChainAddress`].
 fn program_id_bytes(addr: &ChainAddress) -> [u8; 32] {
+    match addr {
+        ChainAddress::Solana(pubkey) => *pubkey,
+        ChainAddress::Evm(_) => [0u8; 32],
+    }
+}
+
+fn account_address_bytes(addr: &ChainAddress) -> [u8; 32] {
     match addr {
         ChainAddress::Solana(pubkey) => *pubkey,
         ChainAddress::Evm(_) => [0u8; 32],
@@ -168,6 +189,282 @@ pub fn write_decoded_events_to_parquet(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
+}
+
+/// Write decoded account states to a parquet file.
+pub fn write_decoded_account_states_to_parquet(
+    account_states: &[DecodedAccountState],
+    schema: &Arc<Schema>,
+    output_path: &Path,
+) -> Result<(), std::io::Error> {
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    let slot_arr: UInt64Array = account_states
+        .iter()
+        .map(|state| Some(state.block_number))
+        .collect();
+    arrays.push(Arc::new(slot_arr));
+
+    let ts_arr: UInt64Array = account_states
+        .iter()
+        .map(|state| Some(state.block_timestamp))
+        .collect();
+    arrays.push(Arc::new(ts_arr));
+
+    if account_states.is_empty() {
+        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(32).finish()));
+    } else {
+        let arr = FixedSizeBinaryArray::try_from_iter(
+            account_states
+                .iter()
+                .map(|state| account_address_bytes(&state.account_address).to_vec()),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        arrays.push(Arc::new(arr));
+    }
+
+    if account_states.is_empty() {
+        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(32).finish()));
+    } else {
+        let arr = FixedSizeBinaryArray::try_from_iter(
+            account_states
+                .iter()
+                .map(|state| account_address_bytes(&state.owner_program).to_vec()),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        arrays.push(Arc::new(arr));
+    }
+
+    let source_arr: StringArray = account_states
+        .iter()
+        .map(|state| Some(state.source_name.as_str()))
+        .collect();
+    arrays.push(Arc::new(source_arr));
+
+    let account_type_arr: StringArray = account_states
+        .iter()
+        .map(|state| Some(state.account_type.as_str()))
+        .collect();
+    arrays.push(Arc::new(account_type_arr));
+
+    let fields_arr: StringArray = account_states
+        .iter()
+        .map(|state| Some(params_to_json(&state.fields)))
+        .collect();
+    arrays.push(Arc::new(fields_arr));
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
+    Ok(())
+}
+
+fn json_to_decoded_fields(json: &str) -> Result<HashMap<Arc<str>, DecodedValue>, std::io::Error> {
+    let parsed: HashMap<String, DecodedValue> = serde_json::from_str(json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(parsed
+        .into_iter()
+        .map(|(key, value)| (Arc::<str>::from(key), value))
+        .collect())
+}
+
+/// Read decoded Solana events from parquet.
+pub fn read_decoded_events_from_parquet(path: &Path) -> Result<Vec<DecodedEvent>, std::io::Error> {
+    use arrow::array::Array;
+
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let mut events = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let slots = batch
+            .column_by_name("slot")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing slot"))?;
+        let timestamps = batch
+            .column_by_name("block_timestamp")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing block_timestamp")
+            })?;
+        let signatures = batch
+            .column_by_name("transaction_signature")
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing transaction_signature",
+                )
+            })?;
+        let program_ids = batch
+            .column_by_name("program_id")
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing program_id")
+            })?;
+        let instruction_indices = batch
+            .column_by_name("instruction_index")
+            .and_then(|col| col.as_any().downcast_ref::<UInt16Array>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing instruction_index")
+            })?;
+        let inner_instruction_indices = batch
+            .column_by_name("inner_instruction_index")
+            .and_then(|col| col.as_any().downcast_ref::<UInt16Array>())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing inner_instruction_index",
+                )
+            })?;
+        let source_names = batch
+            .column_by_name("source_name")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing source_name")
+            })?;
+        let event_names = batch
+            .column_by_name("event_name")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing event_name")
+            })?;
+        let params = batch
+            .column_by_name("params")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing params")
+            })?;
+
+        for row in 0..batch.num_rows() {
+            let signature: [u8; 64] = signatures.value(row).try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "transaction_signature is not 64 bytes",
+                )
+            })?;
+            let program_id: [u8; 32] = program_ids.value(row).try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "program_id is not 32 bytes",
+                )
+            })?;
+
+            events.push(DecodedEvent {
+                block_number: slots.value(row),
+                block_timestamp: timestamps.value(row),
+                transaction_id: TxId::Solana(signature),
+                position: LogPosition::Solana {
+                    instruction_index: instruction_indices.value(row),
+                    inner_instruction_index: if inner_instruction_indices.is_null(row) {
+                        None
+                    } else {
+                        Some(inner_instruction_indices.value(row))
+                    },
+                },
+                contract_address: ChainAddress::Solana(program_id),
+                source_name: source_names.value(row).to_string(),
+                event_name: event_names.value(row).to_string(),
+                event_signature: event_names.value(row).to_string(),
+                params: json_to_decoded_fields(params.value(row))?,
+            });
+        }
+    }
+
+    Ok(events)
+}
+
+/// Read decoded Solana account states from parquet.
+pub fn read_decoded_account_states_from_parquet(
+    path: &Path,
+) -> Result<Vec<DecodedAccountState>, std::io::Error> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let mut account_states = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let slots = batch
+            .column_by_name("slot")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing slot"))?;
+        let timestamps = batch
+            .column_by_name("block_timestamp")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing block_timestamp")
+            })?;
+        let account_addresses = batch
+            .column_by_name("account_address")
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing account_address")
+            })?;
+        let owner_programs = batch
+            .column_by_name("owner_program")
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing owner_program")
+            })?;
+        let source_names = batch
+            .column_by_name("source_name")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing source_name")
+            })?;
+        let account_types = batch
+            .column_by_name("account_type")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing account_type")
+            })?;
+        let fields = batch
+            .column_by_name("fields")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing fields")
+            })?;
+
+        for row in 0..batch.num_rows() {
+            let account_address: [u8; 32] =
+                account_addresses.value(row).try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "account_address is not 32 bytes",
+                    )
+                })?;
+            let owner_program: [u8; 32] = owner_programs.value(row).try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "owner_program is not 32 bytes",
+                )
+            })?;
+
+            account_states.push(DecodedAccountState {
+                block_number: slots.value(row),
+                block_timestamp: timestamps.value(row),
+                account_address: ChainAddress::Solana(account_address),
+                owner_program: ChainAddress::Solana(owner_program),
+                source_name: source_names.value(row).to_string(),
+                account_type: account_types.value(row).to_string(),
+                fields: json_to_decoded_fields(fields.value(row))?,
+            });
+        }
+    }
+
+    Ok(account_states)
 }
 
 #[cfg(test)]

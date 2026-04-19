@@ -41,7 +41,8 @@ use crate::transformations::engine::{
     TransformationEngineConfig,
 };
 use crate::transformations::registry::{
-    build_registry_for_solana_chain, extract_event_name, TransformationRegistry,
+    build_registry_for_solana_chain, extract_event_name,
+    validate_account_state_dependencies_for_solana, TransformationRegistry,
 };
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{Contracts, FactoryCollections};
@@ -138,6 +139,7 @@ impl SolanaChainRuntime {
         config: &IndexerConfig,
         chain: &ChainConfig,
         shared_db_pool: Option<Arc<DbPool>>,
+        handler_filter: Option<&HashSet<String>>,
     ) -> anyhow::Result<Self> {
         let chain = Arc::new(chain.clone());
 
@@ -162,14 +164,19 @@ impl SolanaChainRuntime {
         let configured_programs = build_configured_programs(&chain)?;
 
         // Build registry
-        let registry = Arc::new(build_registry_for_solana_chain(
-            chain.chain_id,
-            &chain.solana_programs,
-        ));
+        let mut registry = build_registry_for_solana_chain(chain.chain_id, &chain.solana_programs);
+        if let Some(names) = handler_filter {
+            registry.filter_to_handlers(names);
+        }
+        let registry = Arc::new(registry);
 
         // Transformations enabled if registry has handlers AND db config present
         let transformations_enabled =
             registry.handler_count() > 0 && config.transformations.is_some();
+
+        if transformations_enabled {
+            validate_account_state_dependencies_for_solana(&registry, &chain.solana_programs);
+        }
 
         // Setup database if transformations enabled
         let db_pool = if transformations_enabled {
@@ -405,6 +412,7 @@ pub async fn process_solana_chain(
     repair: bool,
     repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         chain = chain.name.as_str(),
@@ -413,7 +421,7 @@ pub async fn process_solana_chain(
         "Starting Solana pipeline"
     );
 
-    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
+    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool, handler_filter).await?;
 
     let channel_capacity = config
         .raw_data_collection
@@ -441,20 +449,11 @@ pub async fn process_solana_chain(
         (None, None)
     };
 
-    // Transformation channels (decoders → engine)
-    let (transform_events_tx, transform_events_rx) = if runtime.transformations_enabled {
-        let (tx, rx) = mpsc::channel(channel_capacity);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let (transform_complete_tx, transform_complete_rx) = if runtime.transformations_enabled {
-        let (tx, rx) = mpsc::channel(channel_capacity);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // Historical Solana runs now transform from decoded parquet after decode completes.
+    let transform_events_tx: Option<mpsc::Sender<DecodedEventsMessage>> = None;
+    let transform_complete_tx: Option<
+        mpsc::Sender<crate::transformations::engine::RangeCompleteMessage>,
+    > = None;
 
     // --- Spawn tasks ---
 
@@ -478,7 +477,7 @@ pub async fn process_solana_chain(
         let configured_programs = runtime.configured_programs.clone();
         let event_tx = event_decoder_tx.clone();
         let instr_tx = instr_decoder_tx.clone();
-        let backfill_repair_scope = if repair { repair_scope } else { None };
+        let backfill_repair_scope = if repair { repair_scope.clone() } else { None };
 
         tasks.spawn(async move {
             let result = signature_driven_backfill(
@@ -566,55 +565,6 @@ pub async fn process_solana_chain(
     // Drop the original instr_decoder_tx so only the backfill task's clone remains
     drop(instr_decoder_tx);
 
-    // Transformation engine (historical mode)
-    if runtime.transformations_enabled {
-        let tc = config
-            .transformations
-            .as_ref()
-            .expect("transformations_enabled requires transformations config");
-
-        let engine_config = TransformationEngineConfig {
-            chain_name: chain.name.clone(),
-            chain_id: chain.chain_id as u64,
-            mode: ExecutionMode::Streaming,
-            contracts: Contracts::new(),
-            factory_collections: FactoryCollections::new(),
-            handler_concurrency: tc.handler_concurrency,
-            expect_log_completion: runtime.features.has_events,
-            expect_eth_call_completion: false,
-            expect_account_state_completion: false,
-            expect_instruction_completion: runtime.features.has_instructions,
-            from_block: chain.from_block,
-            to_block: chain.to_block,
-        };
-
-        let engine = TransformationEngine::new(
-            runtime.registry.clone(),
-            runtime.db_pool.clone().unwrap(),
-            None,
-            engine_config,
-            runtime.progress_tracker.clone(),
-        )
-        .await
-        .context("failed to create transformation engine")?;
-
-        engine
-            .initialize()
-            .await
-            .context("failed to initialize transformation engine")?;
-
-        let (_dummy_calls_tx, dummy_calls_rx) = mpsc::channel(1);
-        let events_rx = transform_events_rx.unwrap();
-        let complete_rx = transform_complete_rx.unwrap();
-
-        tasks.spawn(async move {
-            engine
-                .run(events_rx, dummy_calls_rx, None, complete_rx, None, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
-        });
-    }
-
     // --- Wait for all tasks ---
 
     while let Some(result) = tasks.join_next().await {
@@ -625,6 +575,59 @@ pub async fn process_solana_chain(
         chain = chain.name.as_str(),
         "Solana historical pipeline complete"
     );
+
+    if runtime.transformations_enabled {
+        crate::solana::historical_accounts::rebuild_cpmm_historical_account_states(
+            chain,
+            if repair { repair_scope.as_ref() } else { None },
+        )
+        .context("failed to rebuild historical CPMM account states")?;
+
+        let tc = config
+            .transformations
+            .as_ref()
+            .expect("transformations_enabled requires transformations config");
+        let mode = if tc.mode.batch_for_catchup {
+            ExecutionMode::Batch {
+                batch_size: tc.mode.catchup_batch_size,
+            }
+        } else {
+            ExecutionMode::Streaming
+        };
+
+        let engine = TransformationEngine::new(
+            runtime.registry.clone(),
+            runtime.db_pool.clone().unwrap(),
+            None,
+            TransformationEngineConfig {
+                chain_name: chain.name.clone(),
+                chain_id: chain.chain_id as u64,
+                chain_type: chain.chain_type,
+                mode,
+                contracts: Contracts::new(),
+                factory_collections: FactoryCollections::new(),
+                handler_concurrency: tc.handler_concurrency,
+                expect_log_completion: false,
+                expect_eth_call_completion: false,
+                expect_account_state_completion: false,
+                expect_instruction_completion: false,
+                from_block: chain.from_block,
+                to_block: chain.to_block,
+            },
+            None,
+        )
+        .await
+        .context("failed to create transformation engine")?;
+
+        engine
+            .initialize()
+            .await
+            .context("failed to initialize transformation engine")?;
+        engine
+            .run_catchup()
+            .await
+            .map_err(|e| anyhow::anyhow!("transformation catchup error: {}", e))?;
+    }
 
     // --- Live mode ---
 
@@ -1671,6 +1674,7 @@ async fn run_solana_live_mode(
         let engine_config = TransformationEngineConfig {
             chain_name: chain.name.clone(),
             chain_id: chain.chain_id as u64,
+            chain_type: chain.chain_type,
             mode: ExecutionMode::Streaming,
             contracts: Contracts::new(),
             factory_collections: FactoryCollections::new(),
@@ -1699,10 +1703,11 @@ async fn run_solana_live_mode(
             .context("failed to initialize transformation engine")?;
 
         // Dummy calls channel (Solana has no eth_calls)
-        let (_dummy_calls_tx, dummy_calls_rx) = mpsc::channel(1);
+        let (dummy_calls_tx, dummy_calls_rx) = mpsc::channel(1);
 
         let events_rx = transform_events_rx.unwrap();
         let complete_rx = transform_complete_rx.unwrap();
+        drop(dummy_calls_tx);
 
         tasks.spawn(async move {
             engine
@@ -1760,12 +1765,13 @@ pub async fn process_solana_chain_live_only(
     config: &IndexerConfig,
     chain: &ChainConfig,
     shared_db_pool: Option<Arc<DbPool>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         chain = chain.name.as_str(),
         "Starting Solana live-only pipeline"
     );
-    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
+    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool, handler_filter).await?;
     run_solana_live_mode(config, &runtime).await
 }
 
@@ -1782,25 +1788,12 @@ pub async fn transform_only_solana_chain(
         "Transformation-only mode for Solana chain"
     );
 
-    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
+    let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool, handler_filter).await?;
 
     if !runtime.transformations_enabled {
         tracing::info!(
             chain = chain.name.as_str(),
             "No transformation handlers registered for chain, nothing to do"
-        );
-        return Ok(());
-    }
-
-    let mut registry = build_registry_for_solana_chain(chain.chain_id, &chain.solana_programs);
-    if let Some(names) = handler_filter {
-        registry.filter_to_handlers(names);
-    }
-
-    if registry.is_empty() {
-        tracing::info!(
-            chain = chain.name.as_str(),
-            "No transformation handlers remain after filtering, nothing to do"
         );
         return Ok(());
     }
@@ -1817,7 +1810,9 @@ pub async fn transform_only_solana_chain(
         ExecutionMode::Streaming
     };
 
-    let registry = Arc::new(registry);
+    let registry = runtime.registry.clone();
+    crate::solana::historical_accounts::rebuild_cpmm_historical_account_states(chain, None)
+        .context("failed to rebuild historical CPMM account states")?;
     let engine = TransformationEngine::new(
         registry.clone(),
         runtime
@@ -1828,6 +1823,7 @@ pub async fn transform_only_solana_chain(
         TransformationEngineConfig {
             chain_name: chain.name.clone(),
             chain_id: chain.chain_id,
+            chain_type: chain.chain_type,
             mode,
             contracts: Contracts::new(),
             factory_collections: FactoryCollections::new(),
@@ -1999,6 +1995,12 @@ pub async fn decode_only_solana_chain(
     while let Some(result) = tasks.join_next().await {
         result.context("Solana decode-only task panicked")??;
     }
+
+    crate::solana::historical_accounts::rebuild_cpmm_historical_account_states(
+        chain,
+        repair_scope.as_ref(),
+    )
+    .context("failed to rebuild historical CPMM account states")?;
 
     tracing::info!(
         chain = chain.name.as_str(),

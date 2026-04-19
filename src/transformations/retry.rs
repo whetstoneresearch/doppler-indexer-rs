@@ -10,7 +10,7 @@ use std::sync::Arc;
 use metrics::counter;
 use tokio::sync::Mutex;
 
-use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
+use super::context::{DecodedAccountState, DecodedCall, DecodedEvent, TransactionAddresses};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{run_handler_task, DbExecMode};
@@ -29,7 +29,9 @@ use crate::live::{
     LiveProgressTracker, LiveStorage, ProgressStatusStorage, StorageError, TransformRetryRequest,
 };
 use crate::rpc::UnifiedRpcClient;
-use crate::types::chain::{ChainAddress, LogPosition, TxId};
+#[cfg(feature = "solana")]
+use crate::solana::live::storage::SolanaLiveStorage;
+use crate::types::chain::{ChainAddress, ChainType, LogPosition, TxId};
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
 
@@ -49,6 +51,10 @@ struct RetryHandler {
     triggers: HashSet<(String, String)>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: HashSet<(String, String)>,
+    /// Hard account-state dependencies (Event handlers only; empty for Call handlers).
+    account_state_deps: HashSet<(String, String)>,
+    /// Optional account-state dependencies (Event handlers only; empty for Call handlers).
+    optional_account_state_deps: HashSet<(String, String)>,
     /// Handler dependencies: handler name() values that must complete first.
     handler_deps: Vec<String>,
     kind: HandlerKind,
@@ -62,6 +68,7 @@ struct RetryPayload {
     handler: Arc<dyn super::traits::TransformationHandler>,
     handler_events: Arc<Vec<DecodedEvent>>,
     handler_calls: Arc<Vec<DecodedCall>>,
+    handler_account_states: Arc<Vec<DecodedAccountState>>,
     tx_addresses: Arc<HashMap<TxId, TransactionAddresses>>,
 }
 
@@ -91,6 +98,33 @@ pub(crate) fn missing_retry_call_dependencies(
         .difference(&available_calls)
         .cloned()
         .collect()
+}
+
+pub(crate) fn missing_retry_account_state_dependencies(
+    required_account_states: &HashSet<(String, String)>,
+    account_states: &[DecodedAccountState],
+) -> HashSet<(String, String)> {
+    let available_account_states: HashSet<(String, String)> = account_states
+        .iter()
+        .map(|account_state| {
+            (
+                account_state.source_name.clone(),
+                account_state.account_type.clone(),
+            )
+        })
+        .collect();
+
+    required_account_states
+        .difference(&available_account_states)
+        .cloned()
+        .collect()
+}
+
+fn merge_account_state_dependencies(
+    required: &HashSet<(String, String)>,
+    optional: &HashSet<(String, String)>,
+) -> HashSet<(String, String)> {
+    required.union(optional).cloned().collect()
 }
 
 pub(crate) fn classify_live_retry_call_artifact(
@@ -187,17 +221,23 @@ impl RetryProcessor {
                 .await;
         }
 
-        let (events, calls) = self.read_live_retry_data(block_number).await?;
+        let (events, calls, account_states) = self.read_live_retry_data(block_number).await?;
         let events = filter_events_by_start_block(self.contracts.as_deref(), events);
         let calls = filter_calls_by_start_block(self.contracts.as_deref(), calls);
 
         let blocked_handlers = self
-            .execute_live_retry_handlers(block_number, events, calls, &missing_handlers)
+            .execute_live_retry_handlers(
+                block_number,
+                events,
+                calls,
+                account_states,
+                &missing_handlers,
+            )
             .await?;
 
         if !blocked_handlers.is_empty() {
             tracing::warn!(
-                "Live retry for block {} is still waiting on call dependencies for handlers {:?}",
+                "Live retry for block {} is still waiting on hard dependencies for handlers {:?}",
                 block_number,
                 blocked_handlers
             );
@@ -212,7 +252,36 @@ impl RetryProcessor {
     async fn read_live_retry_data(
         &self,
         block_number: u64,
-    ) -> Result<(Vec<DecodedEvent>, Vec<DecodedCall>), TransformationError> {
+    ) -> Result<
+        (
+            Vec<DecodedEvent>,
+            Vec<DecodedCall>,
+            Vec<DecodedAccountState>,
+        ),
+        TransformationError,
+    > {
+        match self.retry_chain_type() {
+            ChainType::Evm => self.read_evm_live_retry_data(block_number).await,
+            #[cfg(feature = "solana")]
+            ChainType::Solana => self.read_solana_live_retry_data(block_number).await,
+            #[cfg(not(feature = "solana"))]
+            ChainType::Solana => Err(TransformationError::MissingData(
+                "solana live retry support requires the solana feature".to_string(),
+            )),
+        }
+    }
+
+    async fn read_evm_live_retry_data(
+        &self,
+        block_number: u64,
+    ) -> Result<
+        (
+            Vec<DecodedEvent>,
+            Vec<DecodedCall>,
+            Vec<DecodedAccountState>,
+        ),
+        TransformationError,
+    > {
         let storage = LiveStorage::new(&self.chain_name);
         let mut events = Vec::new();
         let mut calls = Vec::new();
@@ -390,7 +459,56 @@ impl RetryProcessor {
             }
         }
 
-        Ok((events, calls))
+        Ok((events, calls, Vec::new()))
+    }
+
+    #[cfg(feature = "solana")]
+    async fn read_solana_live_retry_data(
+        &self,
+        block_number: u64,
+    ) -> Result<
+        (
+            Vec<DecodedEvent>,
+            Vec<DecodedCall>,
+            Vec<DecodedAccountState>,
+        ),
+        TransformationError,
+    > {
+        let storage = SolanaLiveStorage::new(&self.chain_name);
+        let mut events = Vec::new();
+        let calls = Vec::new();
+        let mut account_states = Vec::new();
+
+        for (source_name, event_name) in storage.list_decoded_types("events", block_number)? {
+            events.extend(storage.read_decoded::<DecodedEvent>(
+                "events",
+                block_number,
+                &source_name,
+                &event_name,
+            )?);
+        }
+
+        for (source_name, instruction_name) in
+            storage.list_decoded_types("instructions", block_number)?
+        {
+            events.extend(storage.read_decoded::<DecodedEvent>(
+                "instructions",
+                block_number,
+                &source_name,
+                &instruction_name,
+            )?);
+        }
+
+        for (source_name, account_type) in storage.list_decoded_types("accounts", block_number)? {
+            account_states.extend(storage.read_decoded::<DecodedAccountState>(
+                "accounts",
+                block_number,
+                &source_name,
+                &account_type,
+            )?);
+        }
+
+        Ok((events, calls, account_states))
     }
 
     async fn execute_live_retry_handlers(
@@ -398,13 +516,15 @@ impl RetryProcessor {
         block_number: u64,
         events: Vec<DecodedEvent>,
         calls: Vec<DecodedCall>,
+        account_states: Vec<DecodedAccountState>,
         missing_handlers: &HashSet<String>,
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
+        let tx_addresses = Arc::new(self.read_live_retry_tx_addresses(block_number)?);
         let events = Arc::new(events);
         let calls = Arc::new(calls);
+        let account_states = Arc::new(account_states);
 
         let tracker = Arc::new(CompletionTracker::new());
 
@@ -414,7 +534,7 @@ impl RetryProcessor {
         let mut immediate_successes: Vec<(String, String)> = Vec::new();
         // Handler keys pre-failed in the tracker because their call dependencies
         // are absent from the available decoded data.
-        let mut call_dep_blocked_keys: HashSet<String> = HashSet::new();
+        let mut dependency_blocked_keys: HashSet<String> = HashSet::new();
         // Work items submitted to the DAG, plus name→key for outcome lookup.
         let mut work_items: Vec<WorkItem> = Vec::new();
         let mut name_to_key: HashMap<String, String> = HashMap::new();
@@ -499,7 +619,7 @@ impl RetryProcessor {
                         "outcome" => "blocked",
                     )
                     .increment(1);
-                    call_dep_blocked_keys.insert(handler_key);
+                    dependency_blocked_keys.insert(handler_key);
                     continue;
                 }
                 calls
@@ -512,6 +632,47 @@ impl RetryProcessor {
                     .collect::<Vec<_>>()
             } else {
                 pre_handler_calls
+            };
+
+            let final_account_states = if rh.kind == HandlerKind::Event {
+                let missing_deps = missing_retry_account_state_dependencies(
+                    &rh.account_state_deps,
+                    &account_states,
+                );
+                if !missing_deps.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: missing hard account-state dependencies {:?}",
+                        handler_key,
+                        block_number,
+                        missing_deps
+                    );
+                    tracker.mark_failed(&handler_name, range_start).await;
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "chain" => self.chain_name.clone(),
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
+                    dependency_blocked_keys.insert(handler_key);
+                    continue;
+                }
+                let all_account_state_deps = merge_account_state_dependencies(
+                    &rh.account_state_deps,
+                    &rh.optional_account_state_deps,
+                );
+                account_states
+                    .iter()
+                    .filter(|account_state| {
+                        all_account_state_deps.contains(&(
+                            account_state.source_name.clone(),
+                            account_state.account_type.clone(),
+                        ))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             };
 
             // tx_addresses for event handlers; empty for call handlers.
@@ -539,6 +700,7 @@ impl RetryProcessor {
                     handler: rh.handler.clone(),
                     handler_events: Arc::new(handler_events),
                     handler_calls: Arc::new(final_calls),
+                    handler_account_states: Arc::new(final_account_states),
                     tx_addresses: item_tx_addresses,
                 }),
             });
@@ -580,7 +742,7 @@ impl RetryProcessor {
                         payload.handler,
                         payload.handler_events,
                         payload.handler_calls,
-                        Arc::new(Vec::new()),
+                        payload.handler_account_states,
                         payload.tx_addresses,
                         chain_name.clone(),
                         chain_id,
@@ -723,7 +885,7 @@ impl RetryProcessor {
             }
         }
 
-        let blocked_handlers: HashSet<String> = call_dep_blocked_keys
+        let blocked_handlers: HashSet<String> = dependency_blocked_keys
             .into_iter()
             .chain(cascade_blocked_keys)
             .collect();
@@ -870,6 +1032,25 @@ impl RetryProcessor {
     fn build_retry_handler_list(&self) -> Vec<RetryHandler> {
         collect_retry_handlers(&self.registry)
     }
+
+    fn retry_chain_type(&self) -> ChainType {
+        self.registry
+            .all_handlers()
+            .iter()
+            .map(|handler| handler.chain_type())
+            .find(|chain_type| *chain_type == ChainType::Solana)
+            .unwrap_or(ChainType::Evm)
+    }
+
+    fn read_live_retry_tx_addresses(
+        &self,
+        block_number: u64,
+    ) -> Result<HashMap<TxId, TransactionAddresses>, TransformationError> {
+        match self.retry_chain_type() {
+            ChainType::Evm => read_live_receipt_addresses(&self.chain_name, block_number),
+            ChainType::Solana => Ok(HashMap::new()),
+        }
+    }
 }
 
 fn collect_retry_handlers(registry: &TransformationRegistry) -> Vec<RetryHandler> {
@@ -883,6 +1064,16 @@ fn collect_retry_handlers(registry: &TransformationRegistry) -> Vec<RetryHandler
             .collect();
         let call_deps: HashSet<(String, String)> =
             info.handler.call_dependencies().into_iter().collect();
+        let account_state_deps: HashSet<(String, String)> = info
+            .handler
+            .account_state_dependencies()
+            .into_iter()
+            .collect();
+        let optional_account_state_deps: HashSet<(String, String)> = info
+            .handler
+            .optional_account_state_dependencies()
+            .into_iter()
+            .collect();
         let handler_deps = registry
             .all_handler_dependencies_for(info.handler.name())
             .to_vec();
@@ -890,6 +1081,8 @@ fn collect_retry_handlers(registry: &TransformationRegistry) -> Vec<RetryHandler
             handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
             triggers,
             call_deps,
+            account_state_deps,
+            optional_account_state_deps,
             handler_deps,
             kind: HandlerKind::Event,
         });
@@ -905,6 +1098,8 @@ fn collect_retry_handlers(registry: &TransformationRegistry) -> Vec<RetryHandler
             handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
             triggers,
             call_deps: HashSet::new(),
+            account_state_deps: HashSet::new(),
+            optional_account_state_deps: HashSet::new(),
             handler_deps: Vec::new(),
             kind: HandlerKind::Call,
         });
@@ -1186,6 +1381,29 @@ mod tests {
         assert_eq!(
             missing,
             HashSet::from([("Pool".to_string(), "liquidity".to_string())])
+        );
+    }
+
+    #[test]
+    fn retry_dependency_check_detects_missing_account_states() {
+        let required = HashSet::from([
+            ("DopplerCPMM".to_string(), "Pool".to_string()),
+            ("DopplerCPMM".to_string(), "Position".to_string()),
+        ]);
+        let account_states = vec![DecodedAccountState {
+            block_number: 100,
+            block_timestamp: 1200,
+            account_address: ChainAddress::Solana([1; 32]),
+            owner_program: ChainAddress::Solana([2; 32]),
+            source_name: "DopplerCPMM".to_string(),
+            account_type: "Pool".to_string(),
+            fields: HashMap::from([(Arc::from("reserve0"), DecodedValue::Uint64(1))]),
+        }];
+
+        let missing = missing_retry_account_state_dependencies(&required, &account_states);
+        assert_eq!(
+            missing,
+            HashSet::from([("DopplerCPMM".to_string(), "Position".to_string())])
         );
     }
 

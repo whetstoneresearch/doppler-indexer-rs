@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::context::{DecodedCall, DecodedEvent};
+use super::context::{DecodedAccountState, DecodedCall, DecodedEvent};
 use super::engine::RangeCompleteKind;
 
 /// Buffered event data waiting for call dependencies and/or handler dependencies.
@@ -20,6 +20,11 @@ pub(crate) struct PendingEventData {
     pub events: Arc<Vec<DecodedEvent>>,
     /// Call dependencies needed: (source, function_name)
     pub required_calls: Vec<(String, String)>,
+    /// Account-state dependencies needed: (source, account_type)
+    pub required_account_states: Vec<(String, String)>,
+    /// Optional account-state dependencies worth waiting for until the stream
+    /// closes, but not required for execution.
+    pub optional_account_states: Vec<(String, String)>,
     /// Handler dependencies needed: handler name() strings
     pub required_handlers: Vec<String>,
 }
@@ -31,6 +36,8 @@ pub(crate) struct TimedOutPendingHandler {
     pub source_name: String,
     pub event_name: String,
     pub required_calls: Vec<(String, String)>,
+    pub required_account_states: Vec<(String, String)>,
+    pub optional_account_states: Vec<(String, String)>,
     pub required_handlers: Vec<String>,
     pub timed_out_after_secs: u64,
 }
@@ -44,9 +51,13 @@ pub(crate) struct LiveProcessingState {
     /// Track which (source, function) calls have arrived for which ranges.
     /// Key: (source_name, function_name), Value: set of (range_start, range_end)
     pub received_calls: HashMap<(String, String), HashSet<(u64, u64)>>,
+    /// Track which (source, account_type) account states have arrived for which ranges.
+    pub received_account_states: HashMap<(String, String), HashSet<(u64, u64)>>,
     /// Accumulated calls per range for event handlers with dependencies.
     /// Key: (range_start, range_end), Value: accumulated calls
     pub calls_buffer: HashMap<(u64, u64), Vec<DecodedCall>>,
+    /// Accumulated account states per range for event handlers with dependencies.
+    pub account_states_buffer: HashMap<(u64, u64), Vec<DecodedAccountState>>,
     /// Buffer events waiting for calls, keyed by handler_key.
     pub pending_events: HashMap<String, Vec<PendingEventData>>,
     /// Tracks which decode streams have completed for a range.
@@ -77,6 +88,7 @@ impl LiveProcessingState {
             if self.calls_buffer.remove(&range_key).is_some() {
                 tracing::debug!("Removed calls buffer for orphaned range {:?}", range_key);
             }
+            self.account_states_buffer.remove(&range_key);
             self.completion.remove(&range_key);
             self.completed_handlers.remove(&range_key);
             self.failed_handlers.remove(&range_key);
@@ -86,6 +98,9 @@ impl LiveProcessingState {
 
             // Remove from received_calls
             for ranges in self.received_calls.values_mut() {
+                ranges.remove(&range_key);
+            }
+            for ranges in self.received_account_states.values_mut() {
                 ranges.remove(&range_key);
             }
 
@@ -120,6 +135,7 @@ impl LiveProcessingState {
     /// Clean up state for a retry request on a given range.
     pub fn cleanup_for_retry(&mut self, range_key: (u64, u64)) {
         self.calls_buffer.remove(&range_key);
+        self.account_states_buffer.remove(&range_key);
         self.completion.remove(&range_key);
         self.finalized_ranges.remove(&range_key);
         self.completed_handlers.remove(&range_key);
@@ -127,6 +143,9 @@ impl LiveProcessingState {
         self.pending_event_timestamps
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
         for ranges in self.received_calls.values_mut() {
+            ranges.remove(&range_key);
+        }
+        for ranges in self.received_account_states.values_mut() {
             ranges.remove(&range_key);
         }
         for pending in self.pending_events.values_mut() {
@@ -168,7 +187,7 @@ impl LiveProcessingState {
                             let elapsed = now.duration_since(first_seen);
                             if elapsed >= timeout {
                                 tracing::error!(
-                                    "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
+                                    "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_required_account_states={:?} waiting_for_optional_account_states={:?} waiting_for_handlers={:?}. \
                                      Force-finalizing range to unblock progress.",
                                     elapsed,
                                     handler_key,
@@ -177,6 +196,8 @@ impl LiveProcessingState {
                                     pending.source_name,
                                     pending.event_name,
                                     pending.required_calls,
+                                    pending.required_account_states,
+                                    pending.optional_account_states,
                                     pending.required_handlers
                                 );
                                 timed_out.entry(handler_key.clone()).or_insert_with(|| {
@@ -185,6 +206,12 @@ impl LiveProcessingState {
                                         source_name: pending.source_name.clone(),
                                         event_name: pending.event_name.clone(),
                                         required_calls: pending.required_calls.clone(),
+                                        required_account_states: pending
+                                            .required_account_states
+                                            .clone(),
+                                        optional_account_states: pending
+                                            .optional_account_states
+                                            .clone(),
                                         required_handlers: pending.required_handlers.clone(),
                                         timed_out_after_secs: elapsed.as_secs(),
                                     }
@@ -223,7 +250,7 @@ impl LiveProcessingState {
                 for pending in pending_list {
                     if (pending.range_start, pending.range_end) == range_key {
                         tracing::warn!(
-                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
+                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_required_account_states={:?} waiting_for_optional_account_states={:?} waiting_for_handlers={:?}. \
                              This may indicate missing eth_call configuration, handler dependency issue, or RPC failure.",
                             handler_key,
                             pending.range_start,
@@ -231,6 +258,8 @@ impl LiveProcessingState {
                             pending.source_name,
                             pending.event_name,
                             pending.required_calls,
+                            pending.required_account_states,
+                            pending.optional_account_states,
                             pending.required_handlers
                         );
                     }
@@ -265,10 +294,14 @@ impl LiveProcessingState {
     /// Clean up state after finalizing a range.
     pub fn cleanup_after_finalize(&mut self, range_key: (u64, u64)) {
         self.calls_buffer.remove(&range_key);
+        self.account_states_buffer.remove(&range_key);
         self.completion.remove(&range_key);
         self.completed_handlers.remove(&range_key);
         self.failed_handlers.remove(&range_key);
         for ranges in self.received_calls.values_mut() {
+            ranges.remove(&range_key);
+        }
+        for ranges in self.received_account_states.values_mut() {
             ranges.remove(&range_key);
         }
         for pending in self.pending_events.values_mut() {
@@ -285,6 +318,48 @@ impl LiveProcessingState {
             .get(&range_key)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Get buffered account states for a range.
+    pub fn get_buffered_account_states(&self, range_key: (u64, u64)) -> Vec<DecodedAccountState> {
+        self.account_states_buffer
+            .get(&range_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Check whether a specific account-state dependency payload arrived for a range.
+    pub fn has_account_state_dependency(
+        &self,
+        range_key: (u64, u64),
+        dependency: &(String, String),
+    ) -> bool {
+        self.received_account_states
+            .get(dependency)
+            .map(|ranges| ranges.contains(&range_key))
+            .unwrap_or(false)
+    }
+
+    /// Return the declared account-state dependencies that are still missing for a range.
+    pub fn missing_account_state_dependencies(
+        &self,
+        range_key: (u64, u64),
+        dependencies: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        dependencies
+            .iter()
+            .filter(|dependency| !self.has_account_state_dependency(range_key, dependency))
+            .cloned()
+            .collect()
+    }
+
+    /// Check whether the account-state stream has completed for a range.
+    pub fn account_states_complete(&self, range_key: (u64, u64)) -> bool {
+        self.completion
+            .get(&range_key)
+            .copied()
+            .unwrap_or_default()
+            .account_states_complete
     }
 }
 
@@ -387,6 +462,54 @@ mod tests {
         assert!(state.is_ready(false, false, false, true));
     }
 
+    #[test]
+    fn account_state_dependency_ready_when_payload_arrives() {
+        let mut state = LiveProcessingState::default();
+        let range_key = (100, 101);
+        let dependency = ("DopplerCPMM".to_string(), "Pool".to_string());
+        state
+            .received_account_states
+            .entry(dependency.clone())
+            .or_default()
+            .insert(range_key);
+
+        assert!(state.has_account_state_dependency(range_key, &dependency));
+    }
+
+    #[test]
+    fn account_state_dependency_does_not_become_ready_after_empty_stream_completion() {
+        let mut state = LiveProcessingState::default();
+        let range_key = (100, 101);
+        let dependency = ("DopplerCPMM".to_string(), "Pool".to_string());
+        state
+            .completion
+            .entry(range_key)
+            .or_default()
+            .mark(RangeCompleteKind::AccountStates);
+
+        assert!(!state.has_account_state_dependency(range_key, &dependency));
+        assert!(state.account_states_complete(range_key));
+    }
+
+    #[test]
+    fn missing_account_state_dependencies_only_lists_absent_payloads() {
+        let mut state = LiveProcessingState::default();
+        let range_key = (100, 101);
+        let present = ("DopplerCPMM".to_string(), "Pool".to_string());
+        let missing = ("DopplerCPMM".to_string(), "Position".to_string());
+        state
+            .received_account_states
+            .entry(present.clone())
+            .or_default()
+            .insert(range_key);
+
+        assert_eq!(
+            state
+                .missing_account_state_dependencies(range_key, &[present.clone(), missing.clone()]),
+            vec![missing],
+        );
+    }
+
     /// Helper: check whether a handler has remaining pending entries for a range.
     /// This mirrors the `has_remaining_pending` check in
     /// `TransformationEngine::try_process_pending_events`.
@@ -464,6 +587,8 @@ mod tests {
             event_name: "Event".to_string(),
             events: Arc::new(vec![]),
             required_calls,
+            required_account_states: vec![],
+            optional_account_states: vec![],
             required_handlers,
         }
     }

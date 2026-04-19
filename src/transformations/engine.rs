@@ -47,7 +47,7 @@ use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
     read_contract_index, ExpectedContracts,
 };
-use crate::types::chain::TxId;
+use crate::types::chain::{ChainType, TxId};
 use crate::types::config::contract::{Contracts, FactoryCollections};
 
 /// Message containing decoded events for a block range.
@@ -125,6 +125,7 @@ pub enum ExecutionMode {
 pub struct TransformationEngineConfig {
     pub chain_name: String,
     pub chain_id: u64,
+    pub chain_type: ChainType,
     pub mode: ExecutionMode,
     pub contracts: Contracts,
     pub factory_collections: FactoryCollections,
@@ -143,7 +144,21 @@ pub struct TransformationEngineConfig {
 type ReadyHandler = (
     Arc<dyn super::traits::TransformationHandler>,
     Arc<Vec<DecodedCall>>,
+    Arc<Vec<DecodedAccountState>>,
 );
+
+fn merge_account_state_dependencies(
+    required: &[(String, String)],
+    optional: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = Vec::with_capacity(required.len() + optional.len());
+    for dependency in required.iter().chain(optional.iter()) {
+        if !merged.contains(dependency) {
+            merged.push(dependency.clone());
+        }
+    }
+    merged
+}
 
 /// Discriminates between event-based and call-based handler processing.
 ///
@@ -165,6 +180,10 @@ struct CatchupHandler {
     triggers: Arc<Vec<(String, String)>>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: Arc<Vec<(String, String)>>,
+    /// Account-state dependencies (Event handlers only; empty for Call handlers).
+    account_state_deps: Arc<Vec<(String, String)>>,
+    /// Optional account-state dependencies (Event handlers only; empty for Call handlers).
+    optional_account_state_deps: Arc<Vec<(String, String)>>,
     /// Same-range handler dependencies gated by the DAG scheduler.
     handler_deps: Arc<Vec<String>>,
     /// Catchup-only dependencies that require the upstream handler to be
@@ -388,13 +407,16 @@ pub struct TransformationEngine {
     historical_reader: Arc<HistoricalDataReader>,
     chain_name: String,
     chain_id: u64,
+    chain_type: ChainType,
     mode: ExecutionMode,
-    decoded_logs_dir: PathBuf,
+    decoded_event_dirs: Vec<PathBuf>,
     decoded_calls_dir: PathBuf,
+    decoded_account_states_dir: Option<PathBuf>,
     raw_eth_calls_dir: PathBuf,
     raw_receipts_dir: PathBuf,
     contracts: Option<Arc<Contracts>>,
     handler_concurrency: usize,
+    expect_account_state_completion: bool,
     // Sub-components
     executor: Arc<HandlerExecutor>,
     finalizer: Arc<RangeFinalizer>,
@@ -424,14 +446,35 @@ impl TransformationEngine {
     ) -> Result<Self, TransformationError> {
         let chain_name = config.chain_name;
         let chain_id = config.chain_id;
+        let chain_type = config.chain_type;
         let mode = config.mode;
         let handler_concurrency = config.handler_concurrency;
 
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
-        let decoded_logs_dir = crate::storage::paths::decoded_logs_dir(&chain_name);
         let decoded_calls_dir = crate::storage::paths::decoded_eth_calls_dir(&chain_name);
         let raw_eth_calls_dir = crate::storage::paths::raw_eth_calls_dir(&chain_name);
         let raw_receipts_dir = crate::storage::paths::raw_receipts_dir(&chain_name);
+        let (decoded_event_dirs, decoded_account_states_dir) = match chain_type {
+            ChainType::Evm => (
+                vec![crate::storage::paths::decoded_logs_dir(&chain_name)],
+                None,
+            ),
+            #[cfg(feature = "solana")]
+            ChainType::Solana => (
+                vec![
+                    crate::storage::paths::decoded_solana_events_dir(&chain_name),
+                    crate::storage::paths::decoded_solana_instructions_dir(&chain_name),
+                ],
+                Some(crate::storage::paths::decoded_solana_accounts_dir(
+                    &chain_name,
+                )),
+            ),
+            #[cfg(not(feature = "solana"))]
+            ChainType::Solana => (
+                vec![crate::storage::paths::decoded_logs_dir(&chain_name)],
+                None,
+            ),
+        };
 
         let contracts = if config.contracts.is_empty() {
             None
@@ -498,13 +541,16 @@ impl TransformationEngine {
             historical_reader,
             chain_name,
             chain_id,
+            chain_type,
             mode,
-            decoded_logs_dir,
+            decoded_event_dirs,
             decoded_calls_dir,
+            decoded_account_states_dir,
             raw_eth_calls_dir,
             raw_receipts_dir,
             contracts,
             handler_concurrency,
+            expect_account_state_completion: config.expect_account_state_completion,
             executor,
             finalizer,
             retry_processor,
@@ -630,6 +676,19 @@ impl TransformationEngine {
         })
         .await
         .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn scan_available_ranges_in_dirs(
+        &self,
+        dirs: &[PathBuf],
+    ) -> Result<Vec<(u64, u64)>, TransformationError> {
+        let mut merged = HashSet::new();
+        for dir in dirs {
+            merged.extend(self.scan_available_ranges(dir).await?);
+        }
+        let mut sorted: Vec<_> = merged.into_iter().collect();
+        sorted.sort_by_key(|(start, _)| *start);
+        Ok(sorted)
     }
 
     /// Check whether a range `[range_start, range_end_exclusive)` overlaps the
@@ -835,16 +894,18 @@ impl TransformationEngine {
     }
 
     async fn run_handler_catchup(&self, kind: HandlerKind) -> Result<(), TransformationError> {
-        let base_dir = match kind {
-            HandlerKind::Event => &self.decoded_logs_dir,
-            HandlerKind::Call => &self.decoded_calls_dir,
-        };
         let kind_label = match kind {
             HandlerKind::Event => "Event",
             HandlerKind::Call => "Call",
         };
 
-        let mut available = self.scan_available_ranges(base_dir).await?;
+        let mut available = match kind {
+            HandlerKind::Event => {
+                self.scan_available_ranges_in_dirs(&self.decoded_event_dirs)
+                    .await?
+            }
+            HandlerKind::Call => self.scan_available_ranges(&self.decoded_calls_dir).await?,
+        };
 
         if self.from_block.is_some() || self.to_block.is_some() {
             let before = available.len();
@@ -873,7 +934,7 @@ impl TransformationEngine {
         // 1. Collect and sort handler descriptors.
         let mut handlers = self.collect_catchup_handlers(kind);
         let trigger_range_sets = self
-            .prepare_catchup_handlers(kind, &mut handlers, base_dir, &mut available)
+            .prepare_catchup_handlers(kind, &mut handlers, &mut available)
             .await?;
         let available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
 
@@ -922,8 +983,10 @@ impl TransformationEngine {
 
         // 6. Execute work items in chunks to bound peak allocation.
         let loader = Arc::new(CatchupLoader {
-            decoded_logs_dir: self.decoded_logs_dir.clone(),
+            chain_type: self.chain_type,
+            decoded_event_dirs: self.decoded_event_dirs.clone(),
             decoded_calls_dir: self.decoded_calls_dir.clone(),
+            decoded_account_states_dir: self.decoded_account_states_dir.clone(),
             raw_receipts_dir: self.raw_receipts_dir.clone(),
             historical_reader: self.historical_reader.clone(),
             rpc_client: self.executor.rpc_client.clone(),
@@ -1027,6 +1090,9 @@ impl TransformationEngine {
                         .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
                         .collect();
                     let call_deps = info.handler.call_dependencies();
+                    let account_state_deps = info.handler.account_state_dependencies();
+                    let optional_account_state_deps =
+                        info.handler.optional_account_state_dependencies();
                     let handler_name = info.handler.name();
                     let handler_deps = self
                         .registry
@@ -1041,6 +1107,8 @@ impl TransformationEngine {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers: Arc::new(triggers),
                         call_deps: Arc::new(call_deps),
+                        account_state_deps: Arc::new(account_state_deps),
+                        optional_account_state_deps: Arc::new(optional_account_state_deps),
                         handler_deps: Arc::new(handler_deps),
                         contiguous_handler_deps: Arc::new(contiguous_handler_deps),
                         kind: HandlerKind::Event,
@@ -1063,6 +1131,8 @@ impl TransformationEngine {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers: Arc::new(triggers),
                         call_deps: Arc::new(Vec::new()),
+                        account_state_deps: Arc::new(Vec::new()),
+                        optional_account_state_deps: Arc::new(Vec::new()),
                         handler_deps: Arc::new(Vec::new()),
                         contiguous_handler_deps: Arc::new(Vec::new()),
                         kind: HandlerKind::Call,
@@ -1079,7 +1149,6 @@ impl TransformationEngine {
         &self,
         kind: HandlerKind,
         handlers: &mut [CatchupHandler],
-        base_dir: &Path,
         available: &mut Vec<(u64, u64)>,
     ) -> Result<HashMap<String, HashSet<(u64, u64)>>, TransformationError> {
         // Sort event handlers by topological order so dependencies are processed first.
@@ -1103,8 +1172,18 @@ impl TransformationEngine {
         for ch in handlers.iter() {
             let mut ranges: HashSet<(u64, u64)> = HashSet::new();
             for (source, trigger_name) in ch.triggers.iter() {
-                let dir = base_dir.join(source).join(trigger_name);
-                ranges.extend(self.scan_available_ranges(&dir).await?);
+                match kind {
+                    HandlerKind::Event => {
+                        for base_dir in &self.decoded_event_dirs {
+                            let dir = base_dir.join(source).join(trigger_name);
+                            ranges.extend(self.scan_available_ranges(&dir).await?);
+                        }
+                    }
+                    HandlerKind::Call => {
+                        let dir = self.decoded_calls_dir.join(source).join(trigger_name);
+                        ranges.extend(self.scan_available_ranges(&dir).await?);
+                    }
+                }
             }
             trigger_range_sets.insert(ch.handler.name().to_string(), ranges);
         }
@@ -1212,6 +1291,8 @@ impl TransformationEngine {
                         handler_version: ch.handler.version(),
                         triggers: ch.triggers.clone(),
                         call_deps: ch.call_deps.clone(),
+                        account_state_deps: ch.account_state_deps.clone(),
+                        optional_account_state_deps: ch.optional_account_state_deps.clone(),
                         kind: ch.kind,
                     }),
                 });
@@ -1512,6 +1593,10 @@ impl TransformationEngine {
 
                 Some(msg) = complete_rx.recv() => {
                     let range_key = (msg.range_start, msg.range_end);
+                    {
+                        let mut state = self.live_state.lock().await;
+                        state.completion.entry(range_key).or_default().mark(msg.kind);
+                    }
 
                     // When all log events have been sent, mark logs complete and
                     // mark untriggered dependency handlers as completed-no-op so
@@ -1519,17 +1604,7 @@ impl TransformationEngine {
                     if msg.kind == RangeCompleteKind::Logs {
                         let dep_names = self.registry.dependency_handler_names();
 
-                        // Mark logs complete before processing pending events so
-                        // that handlers unblocked below are properly recorded in
-                        // completed_handlers (the recording logic gates dep-handler
-                        // completion on logs_complete being true).
                         let mut state = self.live_state.lock().await;
-                        state
-                            .completion
-                            .entry(range_key)
-                            .or_default()
-                            .mark(RangeCompleteKind::Logs);
-
                         if !dep_names.is_empty() {
                             // Compute handler names that are pending (triggered
                             // but waiting on their own deps). These must NOT be
@@ -1572,7 +1647,12 @@ impl TransformationEngine {
                         drop(state);
                     }
 
-                    if matches!(msg.kind, RangeCompleteKind::Logs | RangeCompleteKind::EthCalls) {
+                    if matches!(
+                        msg.kind,
+                        RangeCompleteKind::Logs
+                            | RangeCompleteKind::EthCalls
+                            | RangeCompleteKind::AccountStates
+                    ) {
                         self.try_process_pending_events(range_key).await?;
                     }
 
@@ -1691,6 +1771,12 @@ impl TransformationEngine {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {
                 let call_deps = handler.call_dependencies();
+                let account_state_deps = handler.account_state_dependencies();
+                let optional_account_state_deps = handler.optional_account_state_dependencies();
+                let all_account_state_deps = merge_account_state_dependencies(
+                    &account_state_deps,
+                    &optional_account_state_deps,
+                );
                 let handler_name = handler.name().to_string();
                 let handler_deps = self
                     .registry
@@ -1715,6 +1801,17 @@ impl TransformationEngine {
                             .map(|completed| completed.contains(dep))
                             .unwrap_or(false)
                     });
+                let missing_account_state_deps =
+                    state.missing_account_state_dependencies(range_key, &account_state_deps);
+                let account_state_deps_ready = missing_account_state_deps.is_empty();
+                let missing_optional_account_state_deps = state
+                    .missing_account_state_dependencies(range_key, &optional_account_state_deps);
+                let account_state_stream_closed = !self.expect_account_state_completion
+                    || state.account_states_complete(range_key);
+                let account_state_deps_terminally_missing =
+                    !account_state_deps_ready && account_state_stream_closed;
+                let optional_account_states_pending =
+                    !missing_optional_account_state_deps.is_empty() && !account_state_stream_closed;
 
                 let self_already_failed = state
                     .failed_handlers
@@ -1751,20 +1848,37 @@ impl TransformationEngine {
                             .entry(range_key)
                             .or_default()
                             .insert(handler_name.clone());
-                        dep_failed_names.push(handler_name);
+                        dep_failed_names.push(handler_name.clone());
                     }
                     failed
                 };
 
                 if dep_already_failed {
                     // Don't buffer — handler is already doomed for this range
-                } else if call_deps_ready && handler_deps_ready {
+                } else if account_state_deps_terminally_missing {
+                    tracing::warn!(
+                        "Handler {} failed for block {}: missing hard account-state dependencies {:?}",
+                        handler_key,
+                        msg.range_start,
+                        missing_account_state_deps,
+                    );
+                    state
+                        .failed_handlers
+                        .entry(range_key)
+                        .or_default()
+                        .insert(handler_name.clone());
+                    dep_failed_names.push(handler_name);
+                } else if call_deps_ready
+                    && handler_deps_ready
+                    && account_state_deps_ready
+                    && !optional_account_states_pending
+                {
                     // Ready to execute
-                    if call_deps.is_empty() {
-                        ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
+                    let calls = if call_deps.is_empty() {
+                        Vec::new()
                     } else {
-                        let calls = state.get_buffered_calls(range_key);
-                        let calls: Vec<_> = calls
+                        state
+                            .get_buffered_calls(range_key)
                             .into_iter()
                             .filter(|c| {
                                 let start_block = self
@@ -1776,15 +1890,34 @@ impl TransformationEngine {
                                     });
                                 start_block.is_none_or(|sb| c.block_number >= sb)
                             })
-                            .collect();
-                        tracing::debug!(
-                            "Handler {} deps ready for block {}, {} calls",
-                            handler_key,
-                            msg.range_start,
-                            calls.len()
-                        );
-                        ready_handlers.push((handler.clone(), Arc::new(calls)));
-                    }
+                            .collect()
+                    };
+                    let account_states = if all_account_state_deps.is_empty() {
+                        Vec::new()
+                    } else {
+                        state
+                            .get_buffered_account_states(range_key)
+                            .into_iter()
+                            .filter(|account_state| {
+                                all_account_state_deps.iter().any(|(source, account_type)| {
+                                    account_state.source_name == *source
+                                        && account_state.account_type == *account_type
+                                })
+                            })
+                            .collect()
+                    };
+                    tracing::debug!(
+                        "Handler {} deps ready for block {}, {} calls, {} account states",
+                        handler_key,
+                        msg.range_start,
+                        calls.len(),
+                        account_states.len()
+                    );
+                    ready_handlers.push((
+                        handler.clone(),
+                        Arc::new(calls),
+                        Arc::new(account_states),
+                    ));
                 } else {
                     // Buffer — needs either call deps or handler deps (or both)
                     let waiting_for = if !call_deps_ready && !handler_deps_ready {
@@ -1794,6 +1927,16 @@ impl TransformationEngine {
                         )
                     } else if !call_deps_ready {
                         format!("eth_call deps {:?}", call_deps)
+                    } else if !account_state_deps_ready {
+                        format!(
+                            "required account state deps {:?}",
+                            missing_account_state_deps
+                        )
+                    } else if optional_account_states_pending {
+                        format!(
+                            "optional account state deps {:?}",
+                            missing_optional_account_state_deps
+                        )
                     } else {
                         format!("handler deps {:?}", handler_deps)
                     };
@@ -1810,6 +1953,8 @@ impl TransformationEngine {
                         event_name: msg.event_name.clone(),
                         events: Arc::clone(&events),
                         required_calls: call_deps.clone(),
+                        required_account_states: account_state_deps.clone(),
+                        optional_account_states: optional_account_state_deps.clone(),
                         required_handlers: handler_deps,
                     };
                     let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
@@ -1831,40 +1976,8 @@ impl TransformationEngine {
             }
         } // lock released
 
-        // Handlers skipped because an upstream dep already failed: persist
-        // and cascade so their own dependents are also failed immediately.
-        if !dep_failed_names.is_empty() {
-            if range_key.1 - range_key.0 == 1 {
-                let failed_keys: HashSet<String> = dep_failed_names
-                    .iter()
-                    .filter_map(|name| {
-                        self.registry
-                            .handler_key_for_name(name)
-                            .map(|k| k.to_string())
-                    })
-                    .collect();
-                if let Err(e) = self.status_storage.update_handler_sets_atomic(
-                    range_key.0,
-                    &mut |completed, failed, transformed| {
-                        failed.extend(failed_keys.iter().cloned());
-                        for k in &failed_keys {
-                            completed.remove(k);
-                        }
-                        *transformed = false;
-                    },
-                ) {
-                    if !matches!(e, StorageError::NotFound(_)) {
-                        tracing::warn!(
-                            "Failed to persist dep-failed handlers for block {}: {}",
-                            range_key.0,
-                            e
-                        );
-                    }
-                }
-            }
-            self.cascade_handler_failures(&dep_failed_names, range_key)
-                .await;
-        }
+        self.mark_live_handlers_failed(range_key, dep_failed_names)
+            .await;
 
         if ready_handlers.is_empty() {
             return Ok(());
@@ -1877,11 +1990,11 @@ impl TransformationEngine {
         );
         let tasks: Vec<HandlerTask> = ready_handlers
             .into_iter()
-            .map(|(handler, calls)| HandlerTask {
+            .map(|(handler, calls, account_states)| HandlerTask {
                 handler,
                 events: events.clone(),
                 calls,
-                account_states: Arc::new(Vec::new()),
+                account_states,
                 tx_addresses: tx_addresses.clone(),
             })
             .collect();
@@ -2040,6 +2153,72 @@ impl TransformationEngine {
         }
     }
 
+    /// Persist an explicit set of failed handlers into the live status file for a block.
+    async fn persist_failed_handler_keys(&self, block_number: u64, failed_keys: &HashSet<String>) {
+        if failed_keys.is_empty() {
+            return;
+        }
+
+        if let Err(e) = self.status_storage.update_handler_sets_atomic(
+            block_number,
+            &mut |completed, failed, transformed| {
+                failed.extend(failed_keys.iter().cloned());
+                for handler_key in failed_keys {
+                    completed.remove(handler_key);
+                }
+                *transformed = false;
+            },
+        ) {
+            if !matches!(e, StorageError::NotFound(_)) {
+                tracing::warn!(
+                    "Failed to persist failed handlers for block {}: {}",
+                    block_number,
+                    e
+                );
+            }
+        }
+    }
+
+    async fn mark_live_handlers_failed(&self, range_key: (u64, u64), handler_names: Vec<String>) {
+        let unique_names: HashSet<String> = handler_names.into_iter().collect();
+        if unique_names.is_empty() {
+            return;
+        }
+
+        {
+            let mut state = self.live_state.lock().await;
+            for handler_name in &unique_names {
+                state
+                    .failed_handlers
+                    .entry(range_key)
+                    .or_default()
+                    .insert(handler_name.clone());
+            }
+            if let Some(completed) = state.completed_handlers.get_mut(&range_key) {
+                for handler_name in &unique_names {
+                    completed.remove(handler_name);
+                }
+            }
+        }
+
+        if range_key.1 - range_key.0 == 1 {
+            let failed_keys: HashSet<String> = unique_names
+                .iter()
+                .filter_map(|name| {
+                    self.registry
+                        .handler_key_for_name(name)
+                        .map(|handler_key| handler_key.to_string())
+                })
+                .collect();
+            self.persist_failed_handler_keys(range_key.0, &failed_keys)
+                .await;
+        }
+
+        let cascaded_names: Vec<String> = unique_names.into_iter().collect();
+        self.cascade_handler_failures(&cascaded_names, range_key)
+            .await;
+    }
+
     /// Record progress and persist failures for handler outcomes from a single
     /// block range execution.  For single-block (live) ranges this records
     /// per-handler live progress and writes failures to the status file.
@@ -2171,42 +2350,59 @@ impl TransformationEngine {
         &self,
         msg: DecodedAccountStatesMessage,
     ) -> Result<(), TransformationError> {
+        let range_key = (msg.range_start, msg.range_end);
+        let account_state_key = (msg.source_name.clone(), msg.account_type.clone());
+        {
+            let mut state = self.live_state.lock().await;
+            state
+                .received_account_states
+                .entry(account_state_key)
+                .or_default()
+                .insert(range_key);
+            state
+                .account_states_buffer
+                .entry(range_key)
+                .or_default()
+                .extend(msg.account_states.clone());
+        }
+
         let handlers = self
             .registry
             .handlers_for_account_state(&msg.source_name, &msg.account_type);
-        if handlers.is_empty() {
+
+        if !handlers.is_empty() {
             tracing::debug!(
-                "No account state handlers registered for {}/{}",
+                "Processing {} account states for {}/{} block {} with {} handlers",
+                msg.account_states.len(),
                 msg.source_name,
-                msg.account_type
+                msg.account_type,
+                msg.range_start,
+                handlers.len()
             );
-            return Ok(());
+
+            counter!(
+                "transformation_account_states_processed_total",
+                "source_name" => msg.source_name.clone(),
+                "account_type" => msg.account_type.clone(),
+            )
+            .increment(msg.account_states.len() as u64);
+
+            self.process_range(
+                msg.range_start,
+                msg.range_end,
+                Vec::new(),
+                Vec::new(),
+                msg.account_states,
+            )
+            .await?;
         }
 
-        tracing::debug!(
-            "Processing {} account states for {}/{} block {} with {} handlers",
-            msg.account_states.len(),
-            msg.source_name,
-            msg.account_type,
-            msg.range_start,
-            handlers.len()
-        );
+        self.try_process_pending_events(range_key).await?;
+        self.finalizer
+            .maybe_finalize_range(range_key, &self.live_state)
+            .await?;
 
-        counter!(
-            "transformation_account_states_processed_total",
-            "source_name" => msg.source_name.clone(),
-            "account_type" => msg.account_type.clone(),
-        )
-        .increment(msg.account_states.len() as u64);
-
-        self.process_range(
-            msg.range_start,
-            msg.range_end,
-            Vec::new(),
-            Vec::new(),
-            msg.account_states,
-        )
-        .await
+        Ok(())
     }
 
     /// Batch-insert reverted call information into the `_call_revert_log` table.
@@ -2292,6 +2488,9 @@ impl TransformationEngine {
             )> = {
                 let mut state = self.live_state.lock().await;
                 let mut ready = Vec::new();
+                let account_state_stream_closed = !self.expect_account_state_completion
+                    || state.account_states_complete(range_key);
+                let mut newly_failed_names: Vec<String> = Vec::new();
 
                 let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
 
@@ -2335,6 +2534,39 @@ impl TransformationEngine {
                         continue;
                     }
 
+                    let terminal_missing_account_states = {
+                        let pending = state.pending_events.get(&handler_key).unwrap();
+                        pending.iter().any(|event_data| {
+                            if (event_data.range_start, event_data.range_end) != range_key {
+                                return false;
+                            }
+                            account_state_stream_closed
+                                && !state
+                                    .missing_account_state_dependencies(
+                                        range_key,
+                                        &event_data.required_account_states,
+                                    )
+                                    .is_empty()
+                        })
+                    };
+                    if terminal_missing_account_states {
+                        if let Some(handler_name) = self.registry.handler_name_for_key(&handler_key)
+                        {
+                            tracing::warn!(
+                                "Handler {} failed for block {}: account-state stream completed without required payloads",
+                                handler_key,
+                                range_key.0,
+                            );
+                            state
+                                .failed_handlers
+                                .entry(range_key)
+                                .or_default()
+                                .insert(handler_name.to_string());
+                            newly_failed_names.push(handler_name.to_string());
+                        }
+                        continue;
+                    }
+
                     let ready_indices: Vec<usize> = {
                         let pending = state.pending_events.get(&handler_key).unwrap();
 
@@ -2352,6 +2584,19 @@ impl TransformationEngine {
                                         .map(|ranges| ranges.contains(&range_key))
                                         .unwrap_or(false)
                                 });
+                                let account_states_ready = state
+                                    .missing_account_state_dependencies(
+                                        range_key,
+                                        &event_data.required_account_states,
+                                    )
+                                    .is_empty();
+                                let optional_account_states_ready = state
+                                    .missing_account_state_dependencies(
+                                        range_key,
+                                        &event_data.optional_account_states,
+                                    )
+                                    .is_empty()
+                                    || account_state_stream_closed;
                                 let handlers_ready =
                                     event_data.required_handlers.iter().all(|dep| {
                                         state
@@ -2360,7 +2605,10 @@ impl TransformationEngine {
                                             .map(|completed| completed.contains(dep))
                                             .unwrap_or(false)
                                     });
-                                calls_ready && handlers_ready
+                                calls_ready
+                                    && account_states_ready
+                                    && optional_account_states_ready
+                                    && handlers_ready
                             })
                             .map(|(i, _)| i)
                             .collect()
@@ -2405,6 +2653,18 @@ impl TransformationEngine {
                     }
                 }
 
+                if !newly_failed_names.is_empty() {
+                    let failed_names: Vec<String> = newly_failed_names
+                        .into_iter()
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    drop(state);
+                    self.mark_live_handlers_failed(range_key, failed_names)
+                        .await;
+                    continue;
+                }
+
                 ready
             };
 
@@ -2420,10 +2680,35 @@ impl TransformationEngine {
                     calls,
                 ))
             };
+            let account_states = {
+                let state = self.live_state.lock().await;
+                Arc::new(state.get_buffered_account_states(range_key))
+            };
 
             // Build HandlerTasks and use executor
             let mut tasks = Vec::new();
             for (_handler_key, event_data, handler) in ready_events {
+                let filtered_account_states: Vec<_> =
+                    if event_data.required_account_states.is_empty()
+                        && event_data.optional_account_states.is_empty()
+                    {
+                        Vec::new()
+                    } else {
+                        account_states
+                            .iter()
+                            .filter(|account_state| {
+                                event_data
+                                    .required_account_states
+                                    .iter()
+                                    .chain(event_data.optional_account_states.iter())
+                                    .any(|(source, account_type)| {
+                                        account_state.source_name == *source
+                                            && account_state.account_type == *account_type
+                                    })
+                            })
+                            .cloned()
+                            .collect()
+                    };
                 let tx_addresses = Arc::new(
                     self.read_receipt_addresses(event_data.range_start, event_data.range_end)
                         .await,
@@ -2432,7 +2717,7 @@ impl TransformationEngine {
                     handler,
                     events: event_data.events,
                     calls: calls.clone(),
-                    account_states: Arc::new(Vec::new()),
+                    account_states: Arc::new(filtered_account_states),
                     tx_addresses,
                 });
             }
